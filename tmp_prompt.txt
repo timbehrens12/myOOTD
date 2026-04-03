@@ -1,0 +1,11 @@
+﻿          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Detect fashion items. Return JSON: { "items": [ { "name": "...", "category": "Upper body|Lower body|Shoes|Bags|Accessories|Other", "box_2d": [ymin, xmin, ymax, xmax] } ] }. Normalized boxes 0-1000.' },
+                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } }
+              ]
+            }],
