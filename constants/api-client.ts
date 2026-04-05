@@ -318,12 +318,19 @@ export const apiClient = {
     imageBase64: string,
     _categoryHint: string,
     _mode: "single" | "multi" = "single",
+    photoLayout?: "flat_lay" | "fit_check",
   ) {
-    const prompt = `Identify every clothing item, shoe, bag, accessory, and jewelry in this photo.
+    const scenePrefix =
+      photoLayout === "flat_lay"
+        ? "Scene: flat-lay or items on a surface / hanger / shelf — garments are laid out separately; prefer one entry per distinct piece.\n\n"
+        : photoLayout === "fit_check"
+          ? "Scene: person wearing clothes (mirror selfie, outfit photo, or street shot) — extract every visible garment, shoes, bag, and accessory on the body.\n\n"
+          : "";
+    const prompt = `${scenePrefix}Identify every clothing item, shoe, bag, accessory, and jewelry in this photo.
 Return one JSON array only. Each object: {"name":"≤6 words","category":"top|bottom|outerwear|full body|shoes|accessory|bag","sub_category":"short","color":"one word (metals:gold/silver)","warmth":"warm|cold|both","occasions":["max 5 ids, most relevant only"],"style_tags":["max 3 ids, vibe/aesthetic"],"box_2d":[ymin,xmin,ymax,xmax]}
-Allowed occasion ids (pick ≤5 per item): casual,gym,sport,beach,ski,hiking,brunch,date-night,night-out,festival,wedding,work,school,travel,lounge,errands,cocktail,black-tie
+Allowed occasion ids (pick ≤5 per item): casual,active,going-out,work,travel,lounge,formal
 Allowed style_tags ids (pick ≤3 that best match the item): casual,office,street,evening,sporty,preppy,minimalist,romantic,edgy
-warmth: warm/cold/both by fabric weight. box_2d: 0-1000 tight crop. No markdown.`;
+warmth rules — think about WHEN you would wear this item, not how it looks: "cold"=items you wear to stay warm in fall/winter (ALL coats, jackets, heavy knits, sweaters, hoodies, boots, wool, down, fleece, thermals, fur, puffer, trench coats, parkas, scarves, beanies, gloves); "warm"=items for hot spring/summer weather ONLY (tank tops, shorts, swimwear, sandals, linen, sleeveless, crop tops, sundresses, flip flops); "both"=genuinely year-round (plain t-shirts, jeans, chinos, sneakers, leather bags, jewelry, accessories). IMPORTANT: any coat, jacket, or outerwear is ALWAYS "cold". When unsure default to "both". box_2d: 0-1000 tight crop around the item. No markdown.`;
 
     let json = "";
     let lastVisionErr: unknown;

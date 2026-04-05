@@ -1,20 +1,19 @@
-import { Tabs } from 'expo-router';
+import { BlurView } from "expo-blur";
+import { setLibraryIntent } from "../../lib/uploadIntent";
+import { Tabs, usePathname, useRouter } from "expo-router";
+import React, { useState } from "react";
 import {
-  StyleSheet,
-  View,
-  Text,
-  TouchableOpacity,
-  Modal,
-  TouchableWithoutFeedback,
-  Pressable,
-  DeviceEventEmitter,
-} from 'react-native';
-import { BlurView } from 'expo-blur';
-import Svg, { Rect, Path, Circle } from 'react-native-svg';
-import { Colors, Typography } from '../../constants/AppTheme';
-import { useRouter, usePathname } from 'expo-router';
-import React, { useState } from 'react';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+    DeviceEventEmitter,
+    Modal,
+    Pressable,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import Svg, { Circle, Path, Rect } from "react-native-svg";
+import { Colors, Typography } from "../../constants/AppTheme";
 
 // ─── ICONS (unchanged paths) ─────────────────────────────────────────────────
 
@@ -28,8 +27,13 @@ const IconWrapper = ({
   children: React.ReactNode;
 }) => (
   <View style={styles.tabItem}>
-    <View style={[styles.iconWell, focused && styles.iconWellActive]}>{children}</View>
-    <Text style={[styles.tabLabel, focused && styles.tabLabelActive]} numberOfLines={1}>
+    <View style={[styles.iconWell, focused && styles.iconWellActive]}>
+      {children}
+    </View>
+    <Text
+      style={[styles.tabLabel, focused && styles.tabLabelActive]}
+      numberOfLines={1}
+    >
       {label}
     </Text>
   </View>
@@ -40,7 +44,7 @@ const ArcHome = ({ focused }: { focused: boolean }) => (
     <Svg width="22" height="22" viewBox="0 0 24 24">
       <Path
         d="M3 9L12 2L21 9V20C21 21 20 22 19 22H5C4 22 3 21 3 20V9Z"
-        fill={focused ? Colors.accent : 'none'}
+        fill={focused ? Colors.accent : "none"}
         stroke={focused ? Colors.accent : Colors.textMuted}
         strokeWidth="2.5"
         strokeLinecap="round"
@@ -95,12 +99,18 @@ const ArcAccount = ({ focused }: { focused: boolean }) => (
         r="9"
         stroke={focused ? Colors.accent : Colors.textMuted}
         strokeWidth="2.5"
-        fill={focused ? Colors.accent : 'none'}
+        fill={focused ? Colors.accent : "none"}
       />
-      <Circle cx="12" cy="11" r="3" stroke={focused ? '#FFF' : Colors.textMuted} strokeWidth="1.5" />
+      <Circle
+        cx="12"
+        cy="11"
+        r="3"
+        stroke={focused ? "#FFF" : Colors.textMuted}
+        strokeWidth="1.5"
+      />
       <Path
         d="M7 18C7 18 8.5 15 12 15C15.5 15 17 18 17 18"
-        stroke={focused ? '#FFF' : Colors.textMuted}
+        stroke={focused ? "#FFF" : Colors.textMuted}
         strokeWidth="1.5"
         strokeLinecap="round"
       />
@@ -109,28 +119,57 @@ const ArcAccount = ({ focused }: { focused: boolean }) => (
 );
 
 const PlusMenuIcon = ({ name }: { name: string }) => {
-  const c = '#FFFFFF';
-  if (name === 'plus')
+  const c = "#FFFFFF";
+  if (name === "plus")
     return (
       <Svg width="22" height="22" viewBox="0 0 24 24">
-        <Path d="M12 5v14M5 12h14" stroke={c} strokeWidth="2" strokeLinecap="round" />
+        <Path
+          d="M12 5v14M5 12h14"
+          stroke={c}
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
       </Svg>
     );
-  if (name === 'camera')
+  if (name === "camera")
     return (
       <Svg width="22" height="22" viewBox="0 0 24 24">
-        <Rect x="2" y="5" width="20" height="16" rx="3" stroke={c} strokeWidth="2" fill="none" />
+        <Rect
+          x="2"
+          y="5"
+          width="20"
+          height="16"
+          rx="3"
+          stroke={c}
+          strokeWidth="2"
+          fill="none"
+        />
         <Circle cx="12" cy="13" r="4" stroke={c} strokeWidth="2" fill="none" />
       </Svg>
     );
-  if (name === 'photo')
+  if (name === "photo")
     return (
       <Svg width="22" height="22" viewBox="0 0 24 24">
-        <Rect x="3" y="3" width="18" height="18" rx="2" stroke={c} strokeWidth="2" fill="none" />
-        <Path d="M3 16l5-5 5 5 2-2 6 6" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        <Rect
+          x="3"
+          y="3"
+          width="18"
+          height="18"
+          rx="2"
+          stroke={c}
+          strokeWidth="2"
+          fill="none"
+        />
+        <Path
+          d="M3 16l5-5 5 5 2-2 6 6"
+          stroke={c}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
       </Svg>
     );
-  if (name === 'sparkles')
+  if (name === "sparkles")
     return (
       <Svg width="22" height="22" viewBox="0 0 24 24">
         <Path
@@ -141,7 +180,7 @@ const PlusMenuIcon = ({ name }: { name: string }) => {
         />
       </Svg>
     );
-  if (name === 'outfit')
+  if (name === "outfit")
     return (
       <Svg width="22" height="22" viewBox="0 0 24 24" fill="none">
         <Path
@@ -153,11 +192,17 @@ const PlusMenuIcon = ({ name }: { name: string }) => {
         />
       </Svg>
     );
-  if (name === 'clock')
+  if (name === "clock")
     return (
       <Svg width="22" height="22" viewBox="0 0 24 24">
         <Circle cx="12" cy="12" r="9" stroke={c} strokeWidth="2" fill="none" />
-        <Path d="M12 7v5l3 3" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        <Path
+          d="M12 7v5l3 3"
+          stroke={c}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
       </Svg>
     );
   return null;
@@ -181,21 +226,36 @@ function PlusButton() {
       >
         <View style={styles.plusCircle}>
           <Svg width="24" height="24" viewBox="0 0 24 24">
-            <Path d="M12 5V19M5 12H19" stroke="#FFF" strokeWidth="3" strokeLinecap="round" />
+            <Path
+              d="M12 5V19M5 12H19"
+              stroke="#FFF"
+              strokeWidth="3"
+              strokeLinecap="round"
+            />
           </Svg>
         </View>
       </TouchableOpacity>
 
-      <Modal transparent visible={menuOpen} animationType="fade" onRequestClose={() => setMenuOpen(false)}>
+      <Modal
+        transparent
+        visible={menuOpen}
+        animationType="fade"
+        onRequestClose={() => setMenuOpen(false)}
+      >
         <View style={styles.modalRoot}>
-          <Pressable style={styles.modalBackdrop} onPress={() => setMenuOpen(false)} />
+          <Pressable
+            style={styles.modalBackdrop}
+            onPress={() => setMenuOpen(false)}
+          />
           <View style={[styles.menuSheet, { bottom: menuBottom }]}>
             <View style={styles.menuHandle} />
             <TouchableOpacity
               style={styles.menuRow}
               onPress={() => {
                 setMenuOpen(false);
-                router.push('/upload');
+                setTimeout(() => {
+                  router.push("/add-items" as any);
+                }, 100);
               }}
               activeOpacity={0.7}
             >
@@ -203,23 +263,50 @@ function PlusButton() {
                 <PlusMenuIcon name="camera" />
               </View>
               <View style={styles.menuRowTextBlock}>
-                <Text style={styles.menuRowText}>Add piece</Text>
+                <Text style={styles.menuRowText}>Take a picture</Text>
                 <Text style={styles.menuRowSub}>
-                  Camera or library — one photo, instant cut-out, saved quietly in the background.
+                  Snap a clothing item — AI extracts and reviews before saving.
+                </Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.menuRow}
+              onPress={() => {
+                setMenuOpen(false);
+                setLibraryIntent();
+                setTimeout(() => {
+                  router.push("/add-items" as any);
+                  setTimeout(() => DeviceEventEmitter.emit("openLibraryPicker"), 300);
+                }, 100);
+              }}
+              activeOpacity={0.7}
+            >
+              <View style={styles.menuIconCircle}>
+                <PlusMenuIcon name="photo" />
+              </View>
+              <View style={styles.menuRowTextBlock}>
+                <Text style={styles.menuRowText}>Upload from photos</Text>
+                <Text style={styles.menuRowSub}>
+                  Pick up to 20 photos — AI scans every item across all of them.
                 </Text>
               </View>
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.menuRow}
               activeOpacity={0.7}
-              onPress={() => { setMenuOpen(false); router.push('/(tabs)/fits'); }}
+              onPress={() => {
+                setMenuOpen(false);
+                router.push("/(tabs)/fits");
+              }}
             >
               <View style={styles.menuIconCircle}>
                 <PlusMenuIcon name="outfit" />
               </View>
               <View style={styles.menuRowTextBlock}>
                 <Text style={styles.menuRowText}>Create an outfit</Text>
-                <Text style={styles.menuRowSub}>Build manually or auto-generate from your closet</Text>
+                <Text style={styles.menuRowSub}>
+                  Build manually or auto-generate from your closet
+                </Text>
               </View>
             </TouchableOpacity>
             <TouchableOpacity
@@ -227,11 +314,21 @@ function PlusButton() {
               activeOpacity={0.7}
               onPress={() => {
                 setMenuOpen(false);
-                const isHome = pathname === '/' || pathname === '/index' || pathname === '/(tabs)' || pathname === '/(tabs)/index';
+                const isHome =
+                  pathname === "/" ||
+                  pathname === "/index" ||
+                  pathname === "/(tabs)" ||
+                  pathname === "/(tabs)/index";
                 if (isHome) {
-                  setTimeout(() => DeviceEventEmitter.emit('openAutomation'), 300);
+                  setTimeout(
+                    () => DeviceEventEmitter.emit("openAutomation"),
+                    300,
+                  );
                 } else {
-                  router.push({ pathname: '/', params: { openAutomation: Date.now().toString() } });
+                  router.push({
+                    pathname: "/",
+                    params: { openAutomation: Date.now().toString() },
+                  });
                 }
               }}
             >
@@ -240,7 +337,9 @@ function PlusButton() {
               </View>
               <View style={styles.menuRowTextBlock}>
                 <Text style={styles.menuRowText}>Add automation</Text>
-                <Text style={styles.menuRowSub}>Auto-plan fits around your daily life</Text>
+                <Text style={styles.menuRowSub}>
+                  Auto-plan fits around your daily life
+                </Text>
               </View>
             </TouchableOpacity>
           </View>
@@ -272,34 +371,53 @@ export default function TabLayout() {
             />
             {/* glass sheen overlay */}
             <View style={styles.glassOverlay} />
-            {/* top highlight line */}
-            <View style={styles.glassHighlight} />
           </View>
         ),
         tabBarStyle: {
-          position: 'absolute',
+          position: "absolute",
           left: 0,
           right: 0,
           bottom: 0,
-          width: '100%',
+          width: "100%",
           height: tabBarHeight,
           paddingBottom: barPadBottom,
           paddingTop: 6,
-          backgroundColor: 'transparent',
+          backgroundColor: "transparent",
           borderTopWidth: 0,
           elevation: 0,
-          shadowColor: 'transparent',
+          shadowColor: "transparent",
           shadowOffset: { width: 0, height: 0 },
           shadowOpacity: 0,
           shadowRadius: 0,
         },
       }}
     >
-      <Tabs.Screen name="index" options={{ tabBarIcon: ({ focused }) => <ArcHome focused={focused} /> }} />
-      <Tabs.Screen name="fits" options={{ tabBarIcon: ({ focused }) => <ArcOutfits focused={focused} /> }} />
-      <Tabs.Screen name="upload" options={{ tabBarButton: () => <PlusButton /> }} />
-      <Tabs.Screen name="closet" options={{ tabBarIcon: ({ focused }) => <ArcCloset focused={focused} /> }} />
-      <Tabs.Screen name="account" options={{ tabBarIcon: ({ focused }) => <ArcAccount focused={focused} /> }} />
+      <Tabs.Screen
+        name="index"
+        options={{ tabBarIcon: ({ focused }) => <ArcHome focused={focused} /> }}
+      />
+      <Tabs.Screen
+        name="fits"
+        options={{
+          tabBarIcon: ({ focused }) => <ArcOutfits focused={focused} />,
+        }}
+      />
+      <Tabs.Screen
+        name="upload"
+        options={{ tabBarButton: () => <PlusButton /> }}
+      />
+      <Tabs.Screen
+        name="closet"
+        options={{
+          tabBarIcon: ({ focused }) => <ArcCloset focused={focused} />,
+        }}
+      />
+      <Tabs.Screen
+        name="account"
+        options={{
+          tabBarIcon: ({ focused }) => <ArcAccount focused={focused} />,
+        }}
+      />
     </Tabs>
   );
 }
@@ -307,13 +425,13 @@ export default function TabLayout() {
 const styles = StyleSheet.create({
   tabBarItem: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+    justifyContent: "center",
+    alignItems: "center",
     paddingVertical: 0,
   },
   tabItem: {
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: "center",
+    justifyContent: "center",
     gap: 3,
     minWidth: 56,
   },
@@ -321,27 +439,27 @@ const styles = StyleSheet.create({
     width: 44,
     height: 32,
     borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: "center",
+    justifyContent: "center",
   },
   iconWellActive: {
-    backgroundColor: 'rgba(0,0,0,0.055)',
+    backgroundColor: "rgba(0,0,0,0.055)",
   },
   tabLabel: {
     fontSize: 10,
     fontWeight: Typography.weights.semibold,
-    color: 'rgba(0,0,0,0.32)',
+    color: "rgba(0,0,0,0.32)",
     letterSpacing: 0.2,
   },
   tabLabelActive: {
-    color: '#000000',
+    color: "#000000",
     fontWeight: Typography.weights.bold,
   },
 
   plusBtn: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: "center",
+    justifyContent: "center",
     minWidth: 56,
     paddingVertical: 2,
   },
@@ -349,9 +467,9 @@ const styles = StyleSheet.create({
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: '#000000',
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: "#000000",
+    alignItems: "center",
+    justifyContent: "center",
   },
 
   modalRoot: {
@@ -359,10 +477,10 @@ const styles = StyleSheet.create({
   },
   modalBackdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    backgroundColor: "rgba(0,0,0,0.4)",
   },
   menuSheet: {
-    position: 'absolute',
+    position: "absolute",
     left: 12,
     right: 12,
     backgroundColor: Colors.surface,
@@ -370,29 +488,29 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     paddingBottom: 10,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(0,0,0,0.06)',
-    shadowColor: '#000',
+    borderColor: "rgba(0,0,0,0.06)",
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 12 },
     shadowOpacity: 0.12,
     shadowRadius: 24,
     elevation: 16,
   },
   menuHandle: {
-    alignSelf: 'center',
+    alignSelf: "center",
     width: 36,
     height: 4,
     borderRadius: 2,
-    backgroundColor: 'rgba(0,0,0,0.12)',
+    backgroundColor: "rgba(0,0,0,0.12)",
     marginBottom: 8,
   },
   menuRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: "row",
+    alignItems: "center",
     gap: 14,
     paddingVertical: 12,
     paddingHorizontal: 16,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: 'rgba(0,0,0,0.06)',
+    borderBottomColor: "rgba(0,0,0,0.06)",
   },
   menuRowLast: {
     borderBottomWidth: 0,
@@ -401,21 +519,13 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: '#000000',
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: "#000000",
+    alignItems: "center",
+    justifyContent: "center",
   },
   glassOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(255,255,255,0.18)',
-  },
-  glassHighlight: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    height: StyleSheet.hairlineWidth * 2,
-    backgroundColor: 'rgba(255,255,255,0.7)',
+    backgroundColor: "rgba(255,255,255,0.18)",
   },
   menuRowTextBlock: {
     flex: 1,
@@ -424,19 +534,19 @@ const styles = StyleSheet.create({
   menuRowText: {
     fontSize: 16,
     fontWeight: Typography.weights.semibold,
-    color: '#000000',
+    color: "#000000",
     letterSpacing: -0.2,
   },
   menuRowSub: {
     fontSize: 12,
     fontWeight: Typography.weights.regular,
-    color: 'rgba(0,0,0,0.4)',
+    color: "rgba(0,0,0,0.4)",
     lineHeight: 16,
   },
   menuRowSubHint: {
     fontSize: 11,
     fontWeight: Typography.weights.regular,
-    color: 'rgba(0,0,0,0.32)',
+    color: "rgba(0,0,0,0.32)",
     lineHeight: 15,
     marginTop: 2,
   },

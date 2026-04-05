@@ -9,54 +9,45 @@ export interface OccasionGroup {
   occasions: Occasion[];
 }
 
+/**
+ * Broad, general-purpose occasions.
+ * Groups kept for backwards compat but each group now holds a single occasion.
+ */
 export const OCCASION_GROUPS: OccasionGroup[] = [
+  {
+    id: 'everyday',
+    label: 'Everyday',
+    occasions: [{ id: 'casual', label: 'Casual' }],
+  },
   {
     id: 'active',
     label: 'Active',
-    occasions: [
-      { id: 'gym', label: 'Gym' },
-      { id: 'sport', label: 'Sport' },
-      { id: 'beach', label: 'Beach' },
-      { id: 'ski', label: 'Ski' },
-      { id: 'hiking', label: 'Hiking' },
-    ],
+    occasions: [{ id: 'active', label: 'Active' }],
   },
   {
     id: 'social',
     label: 'Social',
-    occasions: [
-      { id: 'casual', label: 'Casual' },
-      { id: 'brunch', label: 'Brunch' },
-      { id: 'date-night', label: 'Date Night' },
-      { id: 'night-out', label: 'Night Out' },
-      { id: 'festival', label: 'Festival' },
-      { id: 'wedding', label: 'Wedding' },
-    ],
+    occasions: [{ id: 'going-out', label: 'Going Out' }],
   },
   {
     id: 'work',
-    label: 'Work & School',
-    occasions: [
-      { id: 'work', label: 'Work' },
-      { id: 'school', label: 'School' },
-    ],
+    label: 'Work',
+    occasions: [{ id: 'work', label: 'Work' }],
   },
   {
-    id: 'everyday',
-    label: 'Everyday',
-    occasions: [
-      { id: 'travel', label: 'Travel' },
-      { id: 'lounge', label: 'Lounge' },
-      { id: 'errands', label: 'Errands' },
-    ],
+    id: 'travel',
+    label: 'Travel',
+    occasions: [{ id: 'travel', label: 'Travel' }],
+  },
+  {
+    id: 'lounge',
+    label: 'Lounge',
+    occasions: [{ id: 'lounge', label: 'Lounge' }],
   },
   {
     id: 'formal',
     label: 'Formal',
-    occasions: [
-      { id: 'cocktail', label: 'Cocktail' },
-      { id: 'black-tie', label: 'Black Tie' },
-    ],
+    occasions: [{ id: 'formal', label: 'Formal' }],
   },
 ];
 
@@ -71,4 +62,35 @@ export function getGroupForOccasion(occasionId: string): OccasionGroup | undefin
 /** Get all occasion ids that belong to a group */
 export function getOccasionIdsForGroup(groupId: string): string[] {
   return OCCASION_GROUPS.find(g => g.id === groupId)?.occasions.map(o => o.id) ?? [];
+}
+
+/**
+ * Map legacy granular occasion ids to the new broad ones.
+ * Used when loading items that were classified with the old set.
+ */
+const LEGACY_MAP: Record<string, string> = {
+  gym: 'active',
+  sport: 'active',
+  beach: 'active',
+  ski: 'active',
+  hiking: 'active',
+  brunch: 'casual',
+  'date-night': 'going-out',
+  'night-out': 'going-out',
+  festival: 'going-out',
+  wedding: 'formal',
+  school: 'work',
+  errands: 'casual',
+  cocktail: 'formal',
+  'black-tie': 'formal',
+};
+
+/** Normalise an occasion id — returns the broad id for legacy values, passthrough for current ones. */
+export function normalizeOccasion(id: string): string {
+  return LEGACY_MAP[id] ?? id;
+}
+
+/** De-dup & normalise an array of occasion ids. */
+export function normalizeOccasions(ids: string[]): string[] {
+  return [...new Set(ids.map(normalizeOccasion))];
 }

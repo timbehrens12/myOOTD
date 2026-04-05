@@ -1569,7 +1569,7 @@ export default function ClosetScreen() {
           </View>
           <TouchableOpacity
             style={styles.addBtn}
-            onPress={() => router.push("/upload")}
+            onPress={() => router.push("/add-items" as any)}
             activeOpacity={0.8}
           >
             <ArcPlus color="#FFF" size={20} />
@@ -1893,7 +1893,7 @@ export default function ClosetScreen() {
             </Text>
             <TouchableOpacity
               style={[styles.emptyBtn, Styles.glow]}
-              onPress={() => router.push("/upload")}
+              onPress={() => router.push("/add-items" as any)}
             >
               <Text style={styles.emptyBtnText}>DIGITIZE WARDROBE</Text>
             </TouchableOpacity>

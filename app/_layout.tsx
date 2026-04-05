@@ -28,6 +28,7 @@ export default function RootLayout() {
             <Stack.Screen name="terms" options={{ presentation: 'modal' }} />
             <Stack.Screen name="privacy" options={{ presentation: 'modal' }} />
             <Stack.Screen name="autogen" options={{ presentation: 'modal', headerShown: false }} />
+            <Stack.Screen name="add-items" options={{ presentation: 'modal', headerShown: false }} />
             <Stack.Screen name="(tabs)" />
           </Stack>
           <StatusBar style="dark" />

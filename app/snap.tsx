@@ -10,7 +10,7 @@ export default function SnapRedirect() {
   const href = useMemo(
     () =>
       ({
-        pathname: "/upload",
+        pathname: "/add-items",
         params: {
           source: "camera",
           ...(typeof p.categoryHint === "string" && p.categoryHint.trim()

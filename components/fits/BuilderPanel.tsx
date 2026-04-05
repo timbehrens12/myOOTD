@@ -1185,7 +1185,7 @@ export default function BuilderPanel({
   const promptAddNewItem = useCallback(
     (category: string) => {
       const params = category === "All" ? {} : { categoryHint: category };
-      router.push({ pathname: "/upload", params });
+      router.push({ pathname: "/add-items" as any, params });
     },
     [router],
   );

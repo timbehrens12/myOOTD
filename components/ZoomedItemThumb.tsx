@@ -7,7 +7,8 @@ type Props = {
   /** Google-style normalized box [ymin, xmin, ymax, xmax] each 0–1000 */
   box2d?: number[] | null;
   width: number;
-  height: number;
+  /** Omit to stretch and fill the parent's cross-axis height */
+  height?: number;
   onPress?: () => void;
   resizeMode?: 'cover' | 'contain';
 };
@@ -19,25 +20,28 @@ function sanitizeBox(box: unknown): number[] | null {
   const [ymin, xmin, ymax, xmax] = n;
   if (xmax <= xmin || ymax <= ymin) return null;
   if (ymin < 0 || xmin < 0 || ymax > 1000 || xmax > 1000) return null;
-  const area = ((xmax - xmin) * (ymax - ymin)) / 1e6;
-  if (area > 0.55) return null;
   return n;
 }
 
 /**
  * Shows a zoomed crop of the region around `box2d` (when valid), else full image.
+ * When `height` is omitted the outer view uses alignSelf:stretch so it fills
+ * whatever height its parent row gives it.
  */
 export default function ZoomedItemThumb({
   uri,
   box2d,
   width: containerW,
-  height: containerH,
+  height: heightProp,
   onPress,
   resizeMode = 'cover',
 }: Props) {
   const [imgW, setImgW] = useState(0);
   const [imgH, setImgH] = useState(0);
+  const [measuredH, setMeasuredH] = useState(0);
   const box = sanitizeBox(box2d);
+
+  const containerH = heightProp ?? measuredH;
 
   useEffect(() => {
     let cancelled = false;
@@ -62,25 +66,39 @@ export default function ZoomedItemThumb({
   }, [uri]);
 
   const inner =
-    !box || !imgW || !imgH ? (
+    !box || !imgW || !imgH || !containerH ? (
       <Image source={{ uri }} style={StyleSheet.absoluteFillObject} resizeMode={resizeMode} />
     ) : (
       <ZoomedFill uri={uri} box={box} imgW={imgW} imgH={imgH} containerW={containerW} containerH={containerH} />
     );
+
+  const fixedStyle = heightProp
+    ? [styles.wrap, { width: containerW, height: containerH }]
+    : [styles.wrapStretch, { width: containerW }];
+
+  const handleLayout = heightProp
+    ? undefined
+    : (e: { nativeEvent: { layout: { height: number } } }) =>
+        setMeasuredH(e.nativeEvent.layout.height);
 
   if (onPress) {
     return (
       <TouchableOpacity
         activeOpacity={0.85}
         onPress={onPress}
-        style={[styles.wrap, { width: containerW, height: containerH }]}
+        style={fixedStyle}
+        onLayout={handleLayout}
       >
         {inner}
       </TouchableOpacity>
     );
   }
 
-  return <View style={[styles.wrap, { width: containerW, height: containerH }]}>{inner}</View>;
+  return (
+    <View style={fixedStyle} onLayout={handleLayout}>
+      {inner}
+    </View>
+  );
 }
 
 function ZoomedFill({
@@ -103,7 +121,8 @@ function ZoomedFill({
   const realH = ((ymax - ymin) / 1000) * imgH;
   const cx = ((xmin + xmax) / 2000) * imgW;
   const cy = ((ymin + ymax) / 2000) * imgH;
-  const pad = 1.35;
+  // Tight crop — just enough padding so item doesn't touch the edges
+  const pad = 1.05;
   const targetW = Math.max(realW * pad, 1);
   const targetH = Math.max(realH * pad, 1);
   const containerAspect = containerW / Math.max(containerH, 1);
@@ -128,7 +147,7 @@ function ZoomedFill({
   const top = -cropTop * scale;
 
   return (
-    <View style={[styles.wrap, { width: containerW, height: containerH, backgroundColor: Colors.surface }]}>
+    <View style={{ width: containerW, height: containerH, overflow: 'hidden', backgroundColor: Colors.surface }}>
       <Image
         source={{ uri }}
         style={
@@ -149,6 +168,9 @@ function ZoomedFill({
 const styles = StyleSheet.create({
   wrap: {
     overflow: 'hidden',
-    borderRadius: 0,
+  },
+  wrapStretch: {
+    overflow: 'hidden',
+    alignSelf: 'stretch',
   },
 });
