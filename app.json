@@ -50,6 +50,9 @@
       "expo-web-browser",
       "expo-localization"
     ],
+    "autolinking": {
+      "nativeModulesDir": "./modules"
+    },
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
