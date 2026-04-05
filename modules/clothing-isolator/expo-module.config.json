@@ -1,6 +1,6 @@
 {
-  "platforms": ["ios"],
-  "ios": {
-    "podspecPath": "ClothingIsolator.podspec"
+  "platforms": ["apple"],
+  "apple": {
+    "modules": ["ClothingIsolatorModule"]
   }
 }
