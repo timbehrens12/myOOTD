@@ -171,6 +171,33 @@ public final class SAM2Segmenter {
     self.configuration = configuration
   }
 
+  /// Returns a dict describing bundle search results for JS-side debugging.
+  /// Useful when NSLog isn't accessible (e.g., Windows dev without Xcode).
+  public static func bundleDiagnostics(variant: SAM2Configuration.Variant = .small) -> [String: Any] {
+    let names = SAM2Configuration(variant: variant).modelFileNames
+    let bundles: [(String, Bundle)] = [
+      ("main", Bundle.main),
+      ("pod", Bundle(for: SAM2ModelBundle.self)),
+    ]
+    var result: [String: Any] = ["variant": variant.rawValue, "encoderName": names.encoder]
+    for (tag, bundle) in bundles {
+      var b: [String: Any] = [
+        "identifier": bundle.bundleIdentifier ?? "nil",
+        "path": bundle.bundlePath,
+      ]
+      b["encoder_mlmodelc"] = bundle.url(forResource: names.encoder, withExtension: "mlmodelc")?.path ?? "nil"
+      b["encoder_mlpackage"] = bundle.url(forResource: names.encoder, withExtension: "mlpackage")?.path ?? "nil"
+      b["prompt_mlmodelc"] = bundle.url(forResource: names.prompt, withExtension: "mlmodelc")?.path ?? "nil"
+      b["decoder_mlmodelc"] = bundle.url(forResource: names.decoder, withExtension: "mlmodelc")?.path ?? "nil"
+      let allMlmodelc = bundle.paths(forResourcesOfType: "mlmodelc", inDirectory: nil)
+      let allMlpackage = bundle.paths(forResourcesOfType: "mlpackage", inDirectory: nil)
+      b["allMlmodelcInBundle"] = allMlmodelc.map { ($0 as NSString).lastPathComponent }.joined(separator: ",")
+      b["allMlpackageInBundle"] = allMlpackage.map { ($0 as NSString).lastPathComponent }.joined(separator: ",")
+      result[tag] = b
+    }
+    return result
+  }
+
   /// Cheap check — does not force a model load.
   public static func modelsPresentOnDisk(variant: SAM2Configuration.Variant = .small) -> Bool {
     let names = SAM2Configuration(variant: variant).modelFileNames
