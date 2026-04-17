@@ -136,29 +136,69 @@ final class SAM2ModelBundle {
   }
 
   private func loadCompiledModel(named name: String, config: MLModelConfiguration) throws -> MLModel {
-    // Prefer .mlmodelc (compiled at app build time) but allow raw .mlpackage too
-    // (e.g., if someone did an ad-hoc Xcode drag-drop in dev). Search both the
-    // main bundle and this module's bundle.
-    let candidates: [(String, String)] = [
-      (name, "mlmodelc"),
-      (name, "mlpackage"),
-    ]
+    // Prefer .mlmodelc (compiled at app build time) but fall back to raw .mlpackage
+    // (CocoaPods `s.resources` copies .mlpackage directories verbatim without
+    // running the CoreML compiler, so we compile at runtime and cache the result).
     let bundles = [Bundle.main, Bundle(for: SAM2ModelBundle.self)]
     NSLog("[SAM2] loadCompiledModel: searching for '\(name)'")
-    for (bundleIdx, bundle) in bundles.enumerated() {
-      let bundleDesc = bundleIdx == 0 ? "main" : "ClothingIsolator pod"
-      NSLog("[SAM2]   bundle[\(bundleIdx)] (\(bundleDesc)): \(bundle.bundleIdentifier ?? "unknown")")
-      for (res, ext) in candidates {
-        let url = bundle.url(forResource: res, withExtension: ext)
-        NSLog("[SAM2]     lookup '\(res).\(ext)': \(url?.path ?? "NOT FOUND")")
-        if let url = url {
-          NSLog("[SAM2]   ✓ found at \(url.path), loading...")
-          return try MLModel(contentsOf: url, configuration: config)
-        }
+
+    // Pass 1: prefer already-compiled .mlmodelc.
+    for bundle in bundles {
+      if let url = bundle.url(forResource: name, withExtension: "mlmodelc") {
+        NSLog("[SAM2]   ✓ found .mlmodelc at \(url.path), loading directly")
+        return try MLModel(contentsOf: url, configuration: config)
       }
     }
+
+    // Pass 2: compile .mlpackage at runtime, cache the result under Caches/SAM2/.
+    for bundle in bundles {
+      guard let pkgURL = bundle.url(forResource: name, withExtension: "mlpackage") else {
+        continue
+      }
+      NSLog("[SAM2]   found .mlpackage at \(pkgURL.path) — will compile if needed")
+      let cachedURL = try cachedCompiledURL(for: name, sourcePkg: pkgURL)
+      NSLog("[SAM2]   loading compiled model from \(cachedURL.path)")
+      return try MLModel(contentsOf: cachedURL, configuration: config)
+    }
+
     NSLog("[SAM2] modelsNotAvailable: '\(name)' not found in any bundle")
     throw SAM2Error.modelsNotAvailable
+  }
+
+  /// Returns a URL to a compiled `.mlmodelc` for `name`. If the cache is empty
+  /// or stale (source package mtime newer than cached mtime), recompiles.
+  private func cachedCompiledURL(for name: String, sourcePkg: URL) throws -> URL {
+    let fm = FileManager.default
+    let cacheRoot = try fm
+      .url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+      .appendingPathComponent("SAM2Models", isDirectory: true)
+    try fm.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+    let dest = cacheRoot.appendingPathComponent("\(name).mlmodelc", isDirectory: true)
+
+    // Invalidate cache if source mtime is newer than cached mtime.
+    if fm.fileExists(atPath: dest.path) {
+      let srcAttrs = try? fm.attributesOfItem(atPath: sourcePkg.path)
+      let dstAttrs = try? fm.attributesOfItem(atPath: dest.path)
+      let srcMtime = (srcAttrs?[.modificationDate] as? Date) ?? Date.distantPast
+      let dstMtime = (dstAttrs?[.modificationDate] as? Date) ?? Date.distantPast
+      if dstMtime >= srcMtime {
+        NSLog("[SAM2]   cache hit: \(dest.lastPathComponent)")
+        return dest
+      }
+      NSLog("[SAM2]   cache stale, recompiling")
+      try? fm.removeItem(at: dest)
+    }
+
+    NSLog("[SAM2]   compiling \(sourcePkg.lastPathComponent) → cache (first launch only)")
+    let t0 = Date()
+    let compiledTmp = try MLModel.compileModel(at: sourcePkg)
+    let compileMs = Int(Date().timeIntervalSince(t0) * 1000)
+    NSLog("[SAM2]   compiled in \(compileMs)ms → \(compiledTmp.path)")
+
+    // compileModel writes to a temporary location; move to stable cache path.
+    if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
+    try fm.moveItem(at: compiledTmp, to: dest)
+    return dest
   }
 }
 
