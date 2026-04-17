@@ -111,13 +111,10 @@ final class SAM2ModelBundle {
     lastError = nil
 
     let mlConfig = MLModelConfiguration()
-    if #available(iOS 16.0, *) {
-      mlConfig.computeUnits = .all
-    } else if #available(iOS 15.0, *) {
-      mlConfig.computeUnits = .cpuAndNeuralEngine
-    } else {
-      mlConfig.computeUnits = .cpuAndGPU
-    }
+    // `.all` lets CoreML pick CPU + GPU + Neural Engine as appropriate; it's
+    // been available since iOS 13 (the pod's deployment target), so no guards
+    // needed. `.cpuAndNeuralEngine` is iOS 16+ and we don't need to force it.
+    mlConfig.computeUnits = .all
 
     do {
       let names = config.modelFileNames
