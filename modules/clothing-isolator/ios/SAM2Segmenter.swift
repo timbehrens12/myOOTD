@@ -463,8 +463,25 @@ public final class SAM2Segmenter {
 
     // Threshold at zero (binary mask). SAM 2 logits: positive = foreground.
     var bytes = [UInt8](repeating: 0, count: h * w)
+    var fgCount = 0
     for i in 0..<(h * w) {
-      bytes[i] = raw[i] > 0 ? 255 : 0
+      if raw[i] > 0 {
+        bytes[i] = 255
+        fgCount += 1
+      }
+    }
+
+    // Auto-invert when the "foreground" fills most of the frame. Happens when
+    // the box prompt covers (or nearly matches) the full patch — SAM 2 then
+    // returns a mask of *everything in the box*, which is inverted relative to
+    // what we want (the garment, not the scene). Flip and log so we can see.
+    let coverage = Float(fgCount) / Float(h * w)
+    NSLog("[SAM2] mask coverage (pre-invert check) = \(String(format: "%.3f", coverage))")
+    if coverage > 0.85 {
+      NSLog("[SAM2] coverage > 0.85, inverting mask")
+      for i in 0..<(h * w) {
+        bytes[i] = bytes[i] == 255 ? 0 : 255
+      }
     }
 
     return MaskPlane(bytes: bytes, width: w, height: h, minLogit: minV, maxLogit: maxV)
