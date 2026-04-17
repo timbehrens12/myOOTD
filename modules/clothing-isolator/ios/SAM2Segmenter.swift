@@ -144,13 +144,20 @@ final class SAM2ModelBundle {
       (name, "mlpackage"),
     ]
     let bundles = [Bundle.main, Bundle(for: SAM2ModelBundle.self)]
-    for bundle in bundles {
+    NSLog("[SAM2] loadCompiledModel: searching for '\(name)'")
+    for (bundleIdx, bundle) in bundles.enumerated() {
+      let bundleDesc = bundleIdx == 0 ? "main" : "ClothingIsolator pod"
+      NSLog("[SAM2]   bundle[\(bundleIdx)] (\(bundleDesc)): \(bundle.bundleIdentifier ?? "unknown")")
       for (res, ext) in candidates {
-        if let url = bundle.url(forResource: res, withExtension: ext) {
+        let url = bundle.url(forResource: res, withExtension: ext)
+        NSLog("[SAM2]     lookup '\(res).\(ext)': \(url?.path ?? "NOT FOUND")")
+        if let url = url {
+          NSLog("[SAM2]   ✓ found at \(url.path), loading...")
           return try MLModel(contentsOf: url, configuration: config)
         }
       }
     }
+    NSLog("[SAM2] modelsNotAvailable: '\(name)' not found in any bundle")
     throw SAM2Error.modelsNotAvailable
   }
 }
@@ -168,12 +175,18 @@ public final class SAM2Segmenter {
   public static func modelsPresentOnDisk(variant: SAM2Configuration.Variant = .small) -> Bool {
     let names = SAM2Configuration(variant: variant).modelFileNames
     let bundles = [Bundle.main, Bundle(for: SAM2ModelBundle.self)]
-    for bundle in bundles {
-      if bundle.url(forResource: names.encoder, withExtension: "mlmodelc") != nil ||
-         bundle.url(forResource: names.encoder, withExtension: "mlpackage") != nil {
+    NSLog("[SAM2] modelsPresentOnDisk: checking for \(variant.rawValue)")
+    for (bundleIdx, bundle) in bundles.enumerated() {
+      let bundleDesc = bundleIdx == 0 ? "main" : "ClothingIsolator pod"
+      let mlmodelc = bundle.url(forResource: names.encoder, withExtension: "mlmodelc")
+      let mlpackage = bundle.url(forResource: names.encoder, withExtension: "mlpackage")
+      NSLog("[SAM2]   bundle[\(bundleIdx)] (\(bundleDesc)): mlmodelc=\(mlmodelc != nil), mlpackage=\(mlpackage != nil)")
+      if mlmodelc != nil || mlpackage != nil {
+        NSLog("[SAM2]   ✓ models present")
         return true
       }
     }
+    NSLog("[SAM2]   ✗ models NOT found in any bundle")
     return false
   }
 
