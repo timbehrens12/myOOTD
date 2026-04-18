@@ -344,6 +344,39 @@ public class ClothingIsolatorModule: Module {
     return placed.composited(over: clearSquare).cropped(to: CGRect(x: 0, y: 0, width: side, height: side))
   }
 
+  /// Fit `garment` onto a fixed `canvasWidth`×`canvasHeight` transparent canvas
+  /// so the garment's longer axis always takes `garmentFillRatio` × the matching
+  /// canvas axis. Result: uniform visual size and centering across item types —
+  /// tall shirts, wide shoes, square bags all look equally "zoomed in" in the
+  /// preview card. Returns nil on degenerate inputs.
+  private func fitGarmentCentered(
+    garment: CIImage,
+    canvasWidth: CGFloat,
+    canvasHeight: CGFloat,
+    garmentFillRatio: CGFloat
+  ) -> CIImage? {
+    let e = garment.extent
+    guard e.width >= 1, e.height >= 1, e.width.isFinite, e.height.isFinite,
+          canvasWidth >= 32, canvasHeight >= 32,
+          garmentFillRatio > 0, garmentFillRatio <= 1 else { return nil }
+    // Scale so the axis that fills the matching canvas axis first hits the
+    // target ratio. Take the minimum of the two axis-scales — this is contain
+    // logic with the "target" size being `ratio × canvas`, not the full canvas.
+    let targetW = canvasWidth * garmentFillRatio
+    let targetH = canvasHeight * garmentFillRatio
+    let scale = min(targetW / e.width, targetH / e.height)
+    let scaled = garment.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let sw = e.width * scale
+    let sh = e.height * scale
+    let tx = (canvasWidth - sw) / 2
+    let ty = (canvasHeight - sh) / 2
+    let placed = scaled.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+    let clearCanvas = ciClearImage(extent: CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight))
+    return placed.composited(over: clearCanvas).cropped(
+      to: CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
+    )
+  }
+
   /// Contain-fit onto an arbitrary rectangular canvas. Scales `image` so its
   /// LONGER dimension matches the canvas (min scale) — the garment fills the
   /// canvas edge-to-edge on one axis, with centered bands of transparency on
@@ -751,62 +784,35 @@ public class ClothingIsolatorModule: Module {
 
         let polished = polish(image: shifted)
 
-        // Auto-trim transparent margins → tight bbox → 8% breathing room → contain-fit.
-        // Cover-fit was clipping wide items (slides, belts, chains) so the thumbnail
-        // showed only a thin center strip. Contain-fit + breathing room preserves
-        // the whole item with a bit of space so it doesn't look over-zoomed.
+        // Tight-trim alpha → fit into fixed 4:5 canvas where the garment's
+        // longer axis always takes 85% of the matching canvas axis. Uniform
+        // zoom/centering across every item type — the crux of Aesty-style
+        // previews.
         let norm = polished.transformed(
           by: CGAffineTransform(
             translationX: -polished.extent.origin.x,
             y: -polished.extent.origin.y
           )
         )
-        let trimmed: CIImage
+        let tight: CIImage
         if let trimRect = autoTrimAlpha(norm, context: ciContext),
            trimRect.width >= 8, trimRect.height >= 8 {
           let cropped = norm.cropped(to: trimRect)
-          let tight = cropped.transformed(
+          tight = cropped.transformed(
             by: CGAffineTransform(
               translationX: -cropped.extent.origin.x,
               y: -cropped.extent.origin.y
             )
           )
-          let padX = tight.extent.width * 0.08
-          let padY = tight.extent.height * 0.08
-          let paddedExtent = CGRect(
-            x: -padX, y: -padY,
-            width: tight.extent.width + padX * 2,
-            height: tight.extent.height + padY * 2
-          )
-          let paddedBg = ciClearImage(extent: paddedExtent)
-          let padded = tight.composited(over: paddedBg).cropped(to: paddedExtent)
-          trimmed = padded.transformed(
-            by: CGAffineTransform(
-              translationX: -padded.extent.origin.x,
-              y: -padded.extent.origin.y
-            )
-          )
         } else {
-          trimmed = norm
+          tight = norm
         }
-        // Aspect-aware canvas: tall → 1024×1382, wide → 1382×1024, else square.
-        // Contain-fit preserves full garment; matching canvas aspect makes it
-        // fill the preview card instead of floating in dead space.
-        let aspect = trimmed.extent.height / max(trimmed.extent.width, 1)
-        let canvasW: CGFloat
-        let canvasH: CGFloat
-        if aspect > 1.35 {
-          canvasW = kCutoutSquareSide
-          canvasH = kCutoutSquareSide * 1.35
-        } else if aspect < (1.0 / 1.35) {
-          canvasW = kCutoutSquareSide * 1.35
-          canvasH = kCutoutSquareSide
-        } else {
-          canvasW = kCutoutSquareSide
-          canvasH = kCutoutSquareSide
-        }
-        guard let squared = containFitTransparent(image: trimmed, width: canvasW, height: canvasH)
-        else { continue }
+        guard let squared = fitGarmentCentered(
+          garment: tight,
+          canvasWidth: kCutoutSquareSide,
+          canvasHeight: kCutoutSquareSide * 1.25,
+          garmentFillRatio: 0.85
+        ) else { continue }
 
         if let cgOut = ciContext.createCGImage(squared, from: squared.extent),
            let png = UIImage(cgImage: cgOut).pngData() {
@@ -1433,49 +1439,28 @@ public class ClothingIsolatorModule: Module {
     let norm = base.transformed(
       by: CGAffineTransform(translationX: -base.extent.origin.x, y: -base.extent.origin.y)
     )
-    // Auto-trim transparent margins → tight bbox → add breathing room → contain-fit.
-    // The 8% pad after trim prevents items from being flush against the square
-    // edges (looked overly "zoomed in" without it).
-    let trimmed: CIImage
+    // Tight-trim alpha (drop Vision slack) → consistent-size fit into a fixed
+    // 4:5 canvas where the garment's longer axis always takes 85% of the
+    // matching canvas axis. Uniform zoom/centering across every item: tall
+    // shirts ≈ 85% of canvas height, wide shoes ≈ 85% of canvas width, always
+    // centered, always same relative size.
+    let tight: CIImage
     if let trimRect = autoTrimAlpha(norm, context: context),
        trimRect.width >= 8, trimRect.height >= 8 {
       let cropped = norm.cropped(to: trimRect)
-      let tight = cropped.transformed(
-        by: CGAffineTransform(translationX: -cropped.extent.origin.x, y: -cropped.extent.origin.y)
-      )
-      let padX = tight.extent.width * 0.08
-      let padY = tight.extent.height * 0.08
-      let paddedExtent = CGRect(
-        x: -padX, y: -padY,
-        width: tight.extent.width + padX * 2,
-        height: tight.extent.height + padY * 2
-      )
-      let paddedBg = ciClearImage(extent: paddedExtent)
-      let padded = tight.composited(over: paddedBg).cropped(to: paddedExtent)
-      trimmed = padded.transformed(
-        by: CGAffineTransform(translationX: -padded.extent.origin.x, y: -padded.extent.origin.y)
+      tight = cropped.transformed(
+        by: CGAffineTransform(translationX: -cropped.extent.origin.x,
+                              y: -cropped.extent.origin.y)
       )
     } else {
-      trimmed = norm
+      tight = norm
     }
-    // Aspect-aware canvas: tall items (h/w > 1.35) get a 1024×1382 card so
-    // shirts/dresses fill vertically instead of sitting in dead space; wide
-    // items (w/h > 1.35) get 1382×1024 so belts/shoes fill horizontally;
-    // everything else stays square 1024². Contain-fit preserves full garment.
-    let aspect = trimmed.extent.height / max(trimmed.extent.width, 1)
-    let canvasW: CGFloat
-    let canvasH: CGFloat
-    if aspect > 1.35 {
-      canvasW = kCutoutSquareSide
-      canvasH = kCutoutSquareSide * 1.35
-    } else if aspect < (1.0 / 1.35) {
-      canvasW = kCutoutSquareSide * 1.35
-      canvasH = kCutoutSquareSide
-    } else {
-      canvasW = kCutoutSquareSide
-      canvasH = kCutoutSquareSide
-    }
-    let out = containFitTransparent(image: trimmed, width: canvasW, height: canvasH) ?? trimmed
+    guard let out = fitGarmentCentered(
+      garment: tight,
+      canvasWidth: kCutoutSquareSide,                 // 1024
+      canvasHeight: kCutoutSquareSide * 1.25,         // 1280  → 4:5 portrait matches thumb card
+      garmentFillRatio: 0.85                          // longer axis = 85% of matching canvas axis
+    ) else { return nil }
     guard let cgOut = context.createCGImage(out, from: out.extent),
           let png = UIImage(cgImage: cgOut).pngData()
     else { return nil }

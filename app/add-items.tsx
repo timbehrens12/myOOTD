@@ -3869,7 +3869,7 @@ const styles = StyleSheet.create({
   },
   isolatedThumb: {
     width: 140,
-    alignSelf: "stretch",
+    aspectRatio: 0.8, // 4:5 portrait — matches native output canvas so contain-fit has no dead bands
     backgroundColor: "#F5F1EC", // warm neutral — matches competitor's non-white card tone
     justifyContent: "center",
     alignItems: "center",
