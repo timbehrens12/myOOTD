@@ -2,7 +2,6 @@ import { useUser } from "@clerk/clerk-expo";
 import {
     cropGarments,
     cropGarmentsFromOriginal,
-    sam2Diagnostics,
     segmentItems,
 } from "clothing-isolator";
 import { BlurView } from "expo-blur";
@@ -2020,12 +2019,6 @@ export default function AddScreen() {
   };
 
   pickImagesRef.current = pickImages;
-
-  useEffect(() => {
-    sam2Diagnostics().then((d) => {
-      console.log("[SAM2 DIAGNOSTICS]", JSON.stringify(d, null, 2));
-    });
-  }, []);
 
   useEffect(() => {
     if (!isLibraryMenuIntent(params.library)) return;

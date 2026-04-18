@@ -97,13 +97,6 @@ public class ClothingIsolatorModule: Module {
         promise.resolve(result)
       }
     }
-
-    AsyncFunction("sam2Diagnostics") { (promise: Promise) in
-      DispatchQueue.global(qos: .userInitiated).async {
-        let diag = SAM2Segmenter.bundleDiagnostics()
-        promise.resolve(diag)
-      }
-    }
   }
 
   // ── Aesty-style on-device Enhance ─────────────────────────────────────────
@@ -198,41 +191,6 @@ public class ClothingIsolatorModule: Module {
     ])
     var debug: [String: Any] = ["imgW": Int(imgW), "imgH": Int(imgH)]
 
-    // ── SAM 2 (CoreML) preferred path ───────────────────────────────────────
-    // Produces surgically clean edges on patterned fabrics (paisley, stripes,
-    // lace) that VNGenerateForegroundInstanceMaskRequest softens or bleeds.
-    // Runs only when the .mlpackage resources are present; nil return (models
-    // missing, inference failed, or confidence below threshold) falls through
-    // to the Vision path below — zero behavioral regression for builds that
-    // haven't shipped the models yet.
-    if let sam2 = sam2MaskedCIImage(preCroppedCG: cgImage, promptBox: nil) {
-      debug["segmenter"] = "sam2_\(sam2Config.variant.rawValue.lowercased())"
-      debug["sam2Confidence"] = String(format: "%.3f", Double(sam2.confidence))
-
-      // Tight bbox via the alpha channel so the pad/polish/square-fit stages
-      // operate on the garment extent, not the whole patch.
-      let normalized = sam2.masked.transformed(
-        by: CGAffineTransform(translationX: -sam2.masked.extent.origin.x,
-                              y: -sam2.masked.extent.origin.y)
-      )
-      let bbox = autoTrimAlpha(normalized, context: ctx)
-        ?? CGRect(origin: .zero, size: normalized.extent.size)
-      let cropped = normalized.cropped(to: bbox)
-      let composited = cropped.transformed(
-        by: CGAffineTransform(translationX: -cropped.extent.origin.x,
-                              y: -cropped.extent.origin.y)
-      )
-      debug["bboxW"] = Int(composited.extent.width)
-      debug["bboxH"] = Int(composited.extent.height)
-
-      return writeAestyEnhancedPNG(composited: composited, ctx: ctx, debug: debug)
-    } else if SAM2Segmenter.modelsPresentOnDisk(variant: sam2Config.variant) {
-      debug["sam2Skipped"] = "low_confidence_or_failed"
-      debug["sam2Bundle"] = SAM2Segmenter.bundleDiagnostics(variant: sam2Config.variant)
-    } else {
-      debug["sam2Skipped"] = "models_not_installed"
-      debug["sam2Bundle"] = SAM2Segmenter.bundleDiagnostics(variant: sam2Config.variant)
-    }
 
     // ── Vision fallback ────────────────────────────────────────────────────
     debug["segmenter"] = "vision"
@@ -358,47 +316,9 @@ public class ClothingIsolatorModule: Module {
       composited = cleanMaskedCI.composited(over: clearBg)
     }
 
-    // 15% padding around the composite (extends the canvas; transparent outside).
-    let padX = composited.extent.width * 0.15
-    let padY = composited.extent.height * 0.15
-    let paddedRect = CGRect(
-      x: -padX, y: -padY,
-      width: composited.extent.width + padX * 2,
-      height: composited.extent.height + padY * 2
-    )
-    let paddedClear = ciClearImage(extent: paddedRect)
-    let paddedComposed = composited.composited(over: paddedClear).cropped(to: paddedRect)
-    let paddedShifted = paddedComposed.transformed(
-      by: CGAffineTransform(translationX: -paddedComposed.extent.origin.x,
-                            y: -paddedComposed.extent.origin.y)
-    )
-
-    let polished = polishAesty(image: paddedShifted)
-    guard let squared = squareCoverFitTransparent(image: polished, side: kCutoutSquareSide)
-    else {
-      debug["error"] = "square cover fit failed"
-      return ["uri": "", "debug": debug]
-    }
-
-    guard let cgOut = ctx.createCGImage(squared, from: squared.extent),
-          let png = UIImage(cgImage: cgOut).pngData()
-    else {
-      debug["error"] = "png encode failed"
-      return ["uri": "", "debug": debug]
-    }
-
-    debug["outputW"] = Int(squared.extent.width)
-    debug["outputH"] = Int(squared.extent.height)
-
-    let name = "ootd-enhance-\(UUID().uuidString).png"
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-    do {
-      try png.write(to: url, options: .atomic)
-      return ["uri": url.absoluteString, "debug": debug]
-    } catch {
-      debug["error"] = "file write failed: \(error.localizedDescription)"
-      return ["uri": "", "debug": debug]
-    }
+    // Hand off to the shared Aesty finishing pipeline (tight-trim, 8% pad,
+    // polish, aspect-aware cover fit, PNG write).
+    return writeAestyEnhancedPNG(composited: composited, ctx: ctx, debug: debug)
   }
 
   /// Fully transparent CIImage over `extent` (for compositing under RGBA foreground).
@@ -422,6 +342,30 @@ public class ClothingIsolatorModule: Module {
     let placed = scaled.transformed(by: CGAffineTransform(translationX: tx, y: ty))
     let clearSquare = ciClearImage(extent: CGRect(x: 0, y: 0, width: side, height: side))
     return placed.composited(over: clearSquare).cropped(to: CGRect(x: 0, y: 0, width: side, height: side))
+  }
+
+  /// Cover-fit onto an arbitrary rectangular canvas. Scales `image` so its
+  /// SHORTER dimension matches the canvas (min scale) — the garment fills the
+  /// canvas edge-to-edge on one axis, with centered bands of transparency on
+  /// the other axis. That gives Aesty-style "fills the card" framing without
+  /// clipping extremities.
+  private func coverFitTransparent(image: CIImage, width: CGFloat, height: CGFloat) -> CIImage? {
+    let e = image.extent
+    guard e.width >= 1, e.height >= 1, e.width.isFinite, e.height.isFinite,
+          width >= 32, height >= 32 else { return nil }
+    // Contain-fit (min scale) — keeps the whole garment visible and fills as
+    // much canvas as the tighter axis allows.
+    let scale = min(width / e.width, height / e.height)
+    let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let sw = e.width * scale
+    let sh = e.height * scale
+    let tx = (width - sw) / 2
+    let ty = (height - sh) / 2
+    let placed = scaled.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+    let clearCanvas = ciClearImage(extent: CGRect(x: 0, y: 0, width: width, height: height))
+    return placed.composited(over: clearCanvas).cropped(
+      to: CGRect(x: 0, y: 0, width: width, height: height)
+    )
   }
 
   /// Sample alpha values across the image and report the fraction of pixels with alpha > 16.
@@ -666,80 +610,60 @@ public class ClothingIsolatorModule: Module {
     return clamped
   }
 
-  // ── SAM 2.1 (CoreML) — preferred segmentation when models are shipped ─────
-  //
-  // SAM 2 replaces VNGenerateForegroundInstanceMaskRequest when the .mlpackage
-  // resources are in the app bundle. Vision stays as a graceful fallback (below
-  // confidence threshold, inference failure, or models missing → Vision runs).
-
-  /// Per-call SAM 2 config. Cheap to construct; the heavyweight CoreML models
-  /// are cached in SAM2ModelBundle.shared and survive across calls.
-  private var sam2Config: SAM2Configuration { .default }
-
-  /// Returns a masked RGBA CIImage at `preCroppedCG`'s resolution (transparent
-  /// background where SAM 2 predicted no garment) plus the confidence score.
-  /// nil when SAM 2 models aren't present, inference failed, or confidence is
-  /// below `sam2Config.confidenceThreshold` — callers must fall back to Vision.
-  private func sam2MaskedCIImage(
-    preCroppedCG: CGImage,
-    promptBox: CGRect?
-  ) -> (masked: CIImage, confidence: Float)? {
-    guard SAM2Segmenter.modelsPresentOnDisk(variant: sam2Config.variant) else {
-      return nil
-    }
-    let segmenter = SAM2Segmenter(configuration: sam2Config)
-    guard let result = segmenter.generateMask(for: preCroppedCG, box: promptBox) else {
-      return nil
-    }
-
-    // Upgrade the binary mask's edges before using it as alpha — a small
-    // Gaussian + threshold removes single-pixel stair-stepping that the SAM 2
-    // low-res (256²) output leaves behind after upscaling to patch resolution.
-    // This is the same "polish the mask" step the existing Vision pipeline
-    // benefits from, and is critical for surgical edges on patterned fabrics.
-    let patchCI = CIImage(cgImage: preCroppedCG)
-    var maskCI = CIImage(cgImage: result.mask)
-    if let blurred = CIFilter(name: "CIGaussianBlur", parameters: [
-      kCIInputImageKey: maskCI,
-      kCIInputRadiusKey: 0.8,
-    ])?.outputImage?.cropped(to: maskCI.extent) {
-      maskCI = blurred
-    }
-    let clear = ciClearImage(extent: patchCI.extent)
-    guard let blend = CIFilter(name: "CIBlendWithMask") else { return nil }
-    blend.setValue(patchCI, forKey: kCIInputImageKey)
-    blend.setValue(clear, forKey: kCIInputBackgroundImageKey)
-    blend.setValue(maskCI, forKey: kCIInputMaskImageKey)
-    guard let out = blend.outputImage?.cropped(to: patchCI.extent) else { return nil }
-    return (out, result.confidence)
-  }
-
-  /// Aesty-style finishing pipeline shared by the SAM 2 and Vision paths:
-  /// 15% breathing-room pad, polish (sharpen + contrast/saturation), square
-  /// cover-fit, PNG encode, file write. Returns the `{uri, debug}` dict the
-  /// JS `enhanceItem` API promises.
+  /// Aesty-style finishing pipeline shared by the Vision paths:
+  /// 1) Re-trim to the TIGHT alpha bbox (kills any slack around the garment).
+  /// 2) 8% breathing-room pad (Aesty-style tight framing, not loose 15%).
+  /// 3) Polish (sharpen + contrast/saturation).
+  /// 4) Aspect-aware cover fit — tall items get a 1024×1382 canvas (1.35:1),
+  ///    everything else gets square 1024×1024. Makes tops/dresses fill the
+  ///    preview card vertically instead of floating in dead space.
+  /// 5) PNG encode + file write. Returns the `{uri, debug}` dict.
   private func writeAestyEnhancedPNG(
     composited: CIImage,
     ctx: CIContext,
     debug: [String: Any]
   ) -> [String: Any] {
     var d = debug
-    let padX = composited.extent.width * 0.15
-    let padY = composited.extent.height * 0.15
+
+    // 1) Tight-trim alpha. Vision's bbox can leave slack; trimming the actual
+    //    non-transparent pixels gives us the real garment extent.
+    let trimmed: CIImage
+    if let trimRect = autoTrimAlpha(composited, context: ctx) {
+      let t = composited.cropped(to: trimRect)
+      trimmed = t.transformed(
+        by: CGAffineTransform(translationX: -t.extent.origin.x,
+                              y: -t.extent.origin.y)
+      )
+      d["tightW"] = Int(trimmed.extent.width)
+      d["tightH"] = Int(trimmed.extent.height)
+    } else {
+      trimmed = composited
+    }
+
+    // 2) 8% pad (Aesty-style breathing room).
+    let padX = trimmed.extent.width * 0.08
+    let padY = trimmed.extent.height * 0.08
     let paddedRect = CGRect(
       x: -padX, y: -padY,
-      width: composited.extent.width + padX * 2,
-      height: composited.extent.height + padY * 2
+      width: trimmed.extent.width + padX * 2,
+      height: trimmed.extent.height + padY * 2
     )
     let paddedClear = ciClearImage(extent: paddedRect)
-    let paddedComposed = composited.composited(over: paddedClear).cropped(to: paddedRect)
+    let paddedComposed = trimmed.composited(over: paddedClear).cropped(to: paddedRect)
     let paddedShifted = paddedComposed.transformed(
       by: CGAffineTransform(translationX: -paddedComposed.extent.origin.x,
                             y: -paddedComposed.extent.origin.y)
     )
     let polished = polishAesty(image: paddedShifted)
-    guard let squared = squareCoverFitTransparent(image: polished, side: kCutoutSquareSide) else {
-      d["error"] = "square cover fit failed"
+
+    // 3) Aspect-aware canvas: tall items → 1024×1382, else square 1024².
+    let aspect = polished.extent.height / max(polished.extent.width, 1)
+    let canvasW = kCutoutSquareSide
+    let canvasH = aspect > 1.35 ? kCutoutSquareSide * 1.35 : kCutoutSquareSide
+    d["canvasW"] = Int(canvasW)
+    d["canvasH"] = Int(canvasH)
+    guard let squared = coverFitTransparent(image: polished, width: canvasW, height: canvasH) else {
+      d["error"] = "cover fit failed"
       return ["uri": "", "debug": d]
     }
     guard let cgOut = ctx.createCGImage(squared, from: squared.extent),
@@ -944,67 +868,53 @@ public class ClothingIsolatorModule: Module {
       var finalComposited: CIImage = shiftedOrig
       var usedMask = false
 
-      // ── Per-item segmentation on the pre-cropped region ──────────────────
-      // 1) Prefer SAM 2.1 (CoreML) when models are shipped — surgical edges
-      //    on patterned fabrics (paisley, stripes, lace) that Vision softens.
-      // 2) Fall back to VNGenerateForegroundInstanceMaskRequest on the same
-      //    pre-cropped patch when SAM 2 is unavailable or low-confidence.
-      // 3) Both operate on the pre-cropped patch (not the full body photo)
-      //    so we never get full-person silhouettes leaking across items.
+      // ── Per-item Vision segmentation on the pre-cropped region ──────────
+      // VNGenerateForegroundInstanceMaskRequest runs on the pre-cropped patch
+      // (not the full body photo) so we never get full-person silhouettes
+      // leaking across items.
       let cgCropRect = CGRect(x: cgCropX, y: cgCropY, width: cgCropW, height: cgCropH)
       if let preCroppedCG = cgImage.cropping(to: cgCropRect) {
-        if let sam2 = sam2MaskedCIImage(preCroppedCG: preCroppedCG, promptBox: nil) {
-          // sam2.masked is at preCroppedCG's top-left pixel grid but CIImage coords
-          // are bottom-left; origin is already (0,0) because it came from a CGImage.
-          let normalized = sam2.masked.transformed(
-            by: CGAffineTransform(translationX: -sam2.masked.extent.origin.x,
-                                  y: -sam2.masked.extent.origin.y)
-          )
-          finalComposited = normalized
-          usedMask = true
-        } else {
-          let handler = VNImageRequestHandler(cgImage: preCroppedCG, options: [:])
-          let request = VNGenerateForegroundInstanceMaskRequest()
-          do {
-            try handler.perform([request])
-            if let observation = request.results?.first as? VNInstanceMaskObservation,
-               !observation.allInstances.isEmpty {
+        let handler = VNImageRequestHandler(cgImage: preCroppedCG, options: [:])
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        do {
+          try handler.perform([request])
+          if let observation = request.results?.first as? VNInstanceMaskObservation,
+             !observation.allInstances.isEmpty {
 
-              let buffer = try observation.generateMaskedImage(
-                ofInstances: observation.allInstances,
-                from: handler,
-                croppedToInstancesExtent: false
-              )
-              var maskCI = CIImage(cvPixelBuffer: buffer)
+            let buffer = try observation.generateMaskedImage(
+              ofInstances: observation.allInstances,
+              from: handler,
+              croppedToInstancesExtent: false
+            )
+            var maskCI = CIImage(cvPixelBuffer: buffer)
 
-              // Vision may return the mask at a lower resolution than the pre-crop;
-              // scale it up so every pixel aligns correctly.
-              let mw = maskCI.extent.width
-              let mh = maskCI.extent.height
-              let expW = CGFloat(preCroppedCG.width)
-              let expH = CGFloat(preCroppedCG.height)
-              if (mw != expW || mh != expH), mw > 0, mh > 0 {
-                let sx = expW / mw
-                let sy = expH / mh
-                maskCI = maskCI
-                  .transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-                  .cropped(to: CGRect(x: 0, y: 0, width: expW, height: expH))
-              }
-
-              let coverage = alphaCoverageInBox(maskCI, context: ciContext)
-              if coverage >= 0.04 {
-                let clearBg = ciClearImage(extent: maskCI.extent)
-                let composed = maskCI.composited(over: clearBg)
-                finalComposited = composed.transformed(
-                  by: CGAffineTransform(translationX: -composed.extent.origin.x,
-                                        y: -composed.extent.origin.y)
-                )
-                usedMask = true
-              }
+            // Vision may return the mask at a lower resolution than the pre-crop;
+            // scale it up so every pixel aligns correctly.
+            let mw = maskCI.extent.width
+            let mh = maskCI.extent.height
+            let expW = CGFloat(preCroppedCG.width)
+            let expH = CGFloat(preCroppedCG.height)
+            if (mw != expW || mh != expH), mw > 0, mh > 0 {
+              let sx = expW / mw
+              let sy = expH / mh
+              maskCI = maskCI
+                .transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+                .cropped(to: CGRect(x: 0, y: 0, width: expW, height: expH))
             }
-          } catch {
-            // Vision failed for this box — plain original crop fallback below.
+
+            let coverage = alphaCoverageInBox(maskCI, context: ciContext)
+            if coverage >= 0.04 {
+              let clearBg = ciClearImage(extent: maskCI.extent)
+              let composed = maskCI.composited(over: clearBg)
+              finalComposited = composed.transformed(
+                by: CGAffineTransform(translationX: -composed.extent.origin.x,
+                                      y: -composed.extent.origin.y)
+              )
+              usedMask = true
+            }
           }
+        } catch {
+          // Vision failed for this box — plain original crop fallback below.
         }
       }
 

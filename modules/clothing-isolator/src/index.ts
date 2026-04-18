@@ -58,8 +58,6 @@ interface ClothingIsolatorNativeModule {
     input: string,
     box2d: number[],
   ): Promise<{ uri: string; debug: Record<string, any> }>;
-  /** Returns SAM2 bundle diagnostics (which bundles were searched, what was found). */
-  sam2Diagnostics(): Promise<Record<string, any>>;
 }
 
 export type EnhanceItemResult = {
@@ -178,21 +176,6 @@ export async function enhanceItem(
   }
 }
 
-/**
- * Returns a dict describing SAM 2 model search results — which bundles were
- * checked, what .mlmodelc / .mlpackage files were found in each. Useful for
- * debugging bundle-resource issues without needing Xcode console access.
- * Returns {} when native module unavailable (Android or SAM2 not built in).
- */
-export async function sam2Diagnostics(): Promise<Record<string, any>> {
-  if (!NativeClothingIsolator?.sam2Diagnostics) return {};
-  try {
-    return await NativeClothingIsolator.sam2Diagnostics();
-  } catch (e) {
-    return { error: String(e) };
-  }
-}
-
 export async function polishCutoutUri(fileUri: string): Promise<string | null> {
   if (!NativeClothingIsolator || !fileUri?.trim()) {
     if (__DEV__) console.warn("[polishCutoutUri] skipped: no native module or empty uri");
@@ -215,5 +198,4 @@ export default {
   polishCutout,
   polishCutoutUri,
   enhanceItem,
-  sam2Diagnostics,
 };
