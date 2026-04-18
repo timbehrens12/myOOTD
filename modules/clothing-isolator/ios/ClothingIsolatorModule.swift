@@ -789,7 +789,23 @@ public class ClothingIsolatorModule: Module {
         } else {
           trimmed = norm
         }
-        guard let squared = squareContainFitTransparent(image: trimmed, side: kCutoutSquareSide)
+        // Aspect-aware canvas: tall → 1024×1382, wide → 1382×1024, else square.
+        // Contain-fit preserves full garment; matching canvas aspect makes it
+        // fill the preview card instead of floating in dead space.
+        let aspect = trimmed.extent.height / max(trimmed.extent.width, 1)
+        let canvasW: CGFloat
+        let canvasH: CGFloat
+        if aspect > 1.35 {
+          canvasW = kCutoutSquareSide
+          canvasH = kCutoutSquareSide * 1.35
+        } else if aspect < (1.0 / 1.35) {
+          canvasW = kCutoutSquareSide * 1.35
+          canvasH = kCutoutSquareSide
+        } else {
+          canvasW = kCutoutSquareSide
+          canvasH = kCutoutSquareSide
+        }
+        guard let squared = containFitTransparent(image: trimmed, width: canvasW, height: canvasH)
         else { continue }
 
         if let cgOut = ciContext.createCGImage(squared, from: squared.extent),
