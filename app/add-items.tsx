@@ -2338,7 +2338,7 @@ export default function AddScreen() {
                     <CrossfadeThumbImage
                       uri={item.sourceUri}
                       style={styles.isolatedThumbImg}
-                      resizeMode="cover"
+                      resizeMode="contain"
                     />
                     {item._classifying && (
                       <View style={styles.classifyingBadge}>
