@@ -344,12 +344,12 @@ public class ClothingIsolatorModule: Module {
     return placed.composited(over: clearSquare).cropped(to: CGRect(x: 0, y: 0, width: side, height: side))
   }
 
-  /// Cover-fit onto an arbitrary rectangular canvas. Scales `image` so its
-  /// SHORTER dimension matches the canvas (min scale) — the garment fills the
+  /// Contain-fit onto an arbitrary rectangular canvas. Scales `image` so its
+  /// LONGER dimension matches the canvas (min scale) — the garment fills the
   /// canvas edge-to-edge on one axis, with centered bands of transparency on
-  /// the other axis. That gives Aesty-style "fills the card" framing without
-  /// clipping extremities.
-  private func coverFitTransparent(image: CIImage, width: CGFloat, height: CGFloat) -> CIImage? {
+  /// the other axis. Preserves the full garment without clipping — Aesty-style
+  /// "fills the card" framing when the canvas aspect matches the garment.
+  private func containFitTransparent(image: CIImage, width: CGFloat, height: CGFloat) -> CIImage? {
     let e = image.extent
     guard e.width >= 1, e.height >= 1, e.width.isFinite, e.height.isFinite,
           width >= 32, height >= 32 else { return nil }
@@ -662,7 +662,7 @@ public class ClothingIsolatorModule: Module {
     let canvasH = aspect > 1.35 ? kCutoutSquareSide * 1.35 : kCutoutSquareSide
     d["canvasW"] = Int(canvasW)
     d["canvasH"] = Int(canvasH)
-    guard let squared = coverFitTransparent(image: polished, width: canvasW, height: canvasH) else {
+    guard let squared = containFitTransparent(image: polished, width: canvasW, height: canvasH) else {
       d["error"] = "cover fit failed"
       return ["uri": "", "debug": d]
     }
@@ -1442,7 +1442,24 @@ public class ClothingIsolatorModule: Module {
     } else {
       trimmed = norm
     }
-    let out = squareContainFitTransparent(image: trimmed, side: kCutoutSquareSide) ?? trimmed
+    // Aspect-aware canvas: tall items (h/w > 1.35) get a 1024×1382 card so
+    // shirts/dresses fill vertically instead of sitting in dead space; wide
+    // items (w/h > 1.35) get 1382×1024 so belts/shoes fill horizontally;
+    // everything else stays square 1024². Contain-fit preserves full garment.
+    let aspect = trimmed.extent.height / max(trimmed.extent.width, 1)
+    let canvasW: CGFloat
+    let canvasH: CGFloat
+    if aspect > 1.35 {
+      canvasW = kCutoutSquareSide
+      canvasH = kCutoutSquareSide * 1.35
+    } else if aspect < (1.0 / 1.35) {
+      canvasW = kCutoutSquareSide * 1.35
+      canvasH = kCutoutSquareSide
+    } else {
+      canvasW = kCutoutSquareSide
+      canvasH = kCutoutSquareSide
+    }
+    let out = containFitTransparent(image: trimmed, width: canvasW, height: canvasH) ?? trimmed
     guard let cgOut = context.createCGImage(out, from: out.extent),
           let png = UIImage(cgImage: cgOut).pngData()
     else { return nil }
