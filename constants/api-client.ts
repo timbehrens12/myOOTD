@@ -1,10 +1,10 @@
 /**
- * AI API client — Google Gemini + OpenAI (text/JSON only; no OpenAI image APIs).
- * - Gemini 2.5 Flash Lite: clothing classification (vision + JSON) and outfit selection (text).
+ * AI API client — OpenAI (classify) + Google Gemini (image gen + text fallback).
+ * - OpenAI gpt-5-nano: PRIMARY vision classify with reasoning_effort=minimal.
+ * - Gemini 2.5 Flash Lite: classify FALLBACK + text-only outfit selection.
  * - Gemini 2.5 Flash Image: outfit renders + closet/add-items enhance (catalog cutout).
- * - OpenAI: gpt-5-nano JSON fallback for classify when Gemini fails — not used for image generation.
  *
- * Keys: EXPO_PUBLIC_GOOGLE_AI_API_KEY, EXPO_PUBLIC_OPENAI_API_KEY (classify fallback only)
+ * Keys: EXPO_PUBLIC_OPENAI_API_KEY (primary), EXPO_PUBLIC_GOOGLE_AI_API_KEY
  */
 
 import { Colors } from "./AppTheme";
@@ -16,7 +16,8 @@ const OPENAI_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY;
 const GEMINI_IMAGE_ENHANCE = "gemini-2.5-flash-image";
 const GEMINI_IMAGE_PRIMARY = "gemini-2.5-flash-image";
 const GEMINI_IMAGE_FALLBACK = "gemini-3.1-flash-image-preview";
-const GEMINI_CLASSIFY = "gemini-2.5-flash-lite"; // fastest for classification
+const GEMINI_CLASSIFY = "gemini-2.5-flash-lite"; // fallback for classification
+const OPENAI_CLASSIFY = "gpt-5-nano"; // primary — reasoning_effort=minimal for speed
 
 /** Vision classify returns one JSON object per item; keep high enough to avoid finish_reason:length truncation. */
 export const CLASSIFY_VISION_MAX_COMPLETION_TOKENS = 8192;
@@ -196,6 +197,67 @@ async function callGeminiClassifyVision(
     .trim();
 }
 
+/**
+ * Fast classification via OpenAI gpt-5-nano vision.
+ * `reasoning_effort: "minimal"` disables gpt-5's internal deliberation pass;
+ * for classify this is the biggest latency lever (saves 1–3s per call).
+ * `verbosity: "low"` tells the model to keep JSON terse.
+ */
+async function callOpenAIClassifyVision(
+  prompt: string,
+  imageBase64: string,
+): Promise<string> {
+  if (!OPENAI_KEY) throw new Error("Missing EXPO_PUBLIC_OPENAI_API_KEY");
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_CLASSIFY,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              // response_format=json_object requires a top-level object. Our
+              // downstream parser (normalizeClassifyItems) already unwraps
+              // {items:[…]} into the array shape the rest of the code expects.
+              text: `${prompt}\n\nReturn JSON as {"items": [ ...items... ]} (wrap the array under the "items" key).`,
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:image/jpeg;base64,${imageBase64}`,
+                detail: "low", // "low" = 85 tokens, ~3× faster than "high"; plenty for garment ID
+              },
+            },
+          ],
+        },
+      ],
+      max_completion_tokens: 1200,
+      response_format: { type: "json_object" },
+      reasoning_effort: "minimal",
+      verbosity: "low",
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `OpenAI classify HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  const raw = data.choices?.[0]?.message?.content || "";
+  return raw
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
 
 /** Parse model output when it wraps JSON in prose or truncates; prefer top-level array or object. */
 function parseClassifyJsonPayload(raw: string): unknown {
@@ -410,25 +472,47 @@ warmth: cold ONLY for coats, jackets, puffers, sweaters, hoodies, fleece, boots,
 
     const prompt = isIsolated ? isolatedPrompt : multiPrompt;
 
-    // Gemini classify — retry once on transient failure
+    // Primary: OpenAI gpt-5-nano with reasoning_effort=minimal + detail=low.
+    // Fallback: Gemini 2.5 Flash Lite (retried once). Most of the time OpenAI
+    // wins; if the key is missing or the call fails we still have Gemini.
     let json = "";
     let lastErr: unknown;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    if (OPENAI_KEY) {
       try {
-        if (attempt > 0) await new Promise((r) => setTimeout(r, 800));
-        json = await callGeminiClassifyVision(prompt, imageBase64);
-        if (json.trim()) break;
+        json = await callOpenAIClassifyVision(prompt, imageBase64);
       } catch (e) {
         lastErr = e;
-        console.warn(`[classify] Gemini attempt ${attempt + 1} failed:`, e);
+        console.warn("[classify] OpenAI failed, falling back to Gemini:", e);
       }
     }
     if (!json.trim()) {
-      throw lastErr ?? new Error("Gemini classification returned empty response");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 800));
+          json = await callGeminiClassifyVision(prompt, imageBase64);
+          if (json.trim()) break;
+        } catch (e) {
+          lastErr = e;
+          console.warn(`[classify] Gemini attempt ${attempt + 1} failed:`, e);
+        }
+      }
+    }
+    if (!json.trim()) {
+      throw lastErr ?? new Error("Classification returned empty response");
     }
 
-    // For isolated items the model returns an object, not array — wrap it
-    const rawForParse = isIsolated && json.trim().startsWith("{") ? `[${json}]` : json;
+    // For Gemini isolated items the model returns a single item OBJECT that
+    // needs wrapping. OpenAI always returns a wrapper like {"items":[…]} under
+    // response_format=json_object — `normalizeClassifyItems` unwraps that on
+    // its own, so we must NOT re-wrap it in brackets here.
+    const trimmedJson = json.trim();
+    const looksLikeContainerObject =
+      trimmedJson.startsWith("{") &&
+      /"(items|wardrobe|clothing|pieces|results|outfit)"\s*:/.test(trimmedJson);
+    const rawForParse =
+      isIsolated && trimmedJson.startsWith("{") && !looksLikeContainerObject
+        ? `[${trimmedJson}]`
+        : trimmedJson;
 
     const parsed = parseClassifyJsonPayload(rawForParse);
     const normalized = normalizeClassifyItems(parsed);
