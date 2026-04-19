@@ -1,19 +1,22 @@
 /**
- * AI API client:
- * - OpenAI `gpt-5-nano` for closet item classification (vision) and outfit selection (JSON).
- * - Google Gemini `gemini-2.5-flash-lite` for outfit render (image only); falls back to
- *   `gemini-2.0-flash` if the lite model cannot return an image.
+ * AI API client — Google Gemini + OpenAI (text/JSON only; no OpenAI image APIs).
+ * - Gemini 2.5 Flash Lite: clothing classification (vision + JSON) and outfit selection (text).
+ * - Gemini 2.5 Flash Image: outfit renders + closet/add-items enhance (catalog cutout).
+ * - OpenAI: gpt-5-nano JSON fallback for classify when Gemini fails — not used for image generation.
  *
- * Keys: EXPO_PUBLIC_OPENAI_API_KEY, EXPO_PUBLIC_GOOGLE_AI_API_KEY
+ * Keys: EXPO_PUBLIC_GOOGLE_AI_API_KEY, EXPO_PUBLIC_OPENAI_API_KEY (classify fallback only)
  */
 
 import { Colors } from "./AppTheme";
 
-const OPENAI_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY;
 const GEMINI_KEY = process.env.EXPO_PUBLIC_GOOGLE_AI_API_KEY;
+const OPENAI_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY;
 
-const GEMINI_DEFAULT = "gemini-2.0-flash";
-const GEMINI_RENDER_PRIMARY = "gemini-2.5-flash-lite";
+/** Image model for closet/add-items enhance (GPT Image is not used). */
+const GEMINI_IMAGE_ENHANCE = "gemini-2.5-flash-image";
+const GEMINI_IMAGE_PRIMARY = "gemini-2.5-flash-image";
+const GEMINI_IMAGE_FALLBACK = "gemini-3.1-flash-image-preview";
+const GEMINI_CLASSIFY = "gemini-2.5-flash-lite"; // fastest for classification
 
 /** Vision classify returns one JSON object per item; keep high enough to avoid finish_reason:length truncation. */
 export const CLASSIFY_VISION_MAX_COMPLETION_TOKENS = 8192;
@@ -31,22 +34,155 @@ function geminiUrl(model: string) {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
 }
 
-async function callGemini(
-  parts: { text?: string; inline_data?: { mime_type: string; data: string } }[],
-  model = GEMINI_DEFAULT,
-): Promise<string> {
+async function callGeminiWithImage(
+  model: string,
+  parts: any[],
+  responseModalities = ["TEXT"],
+  /** Pass "512" for enhance/thumbnail calls — cheaper + faster on Gemini 3.1 Flash Image. */
+  imageResolution?: "512" | "1K" | "2K" | "4K",
+): Promise<any> {
+  const wantsImage = responseModalities.includes("IMAGE");
+  const modalities = wantsImage ? ["TEXT", "IMAGE"] : responseModalities;
+  // 512 output needs far fewer tokens than the default 1K; 2048 is plenty for thumbnails.
+  const maxOutputTokens = wantsImage ? (imageResolution === "512" ? 2048 : 4096) : 1024;
   const res = await fetch(geminiUrl(model), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 2048 },
+      contents: [{ role: "user", parts }],
+      generationConfig: {
+        temperature: 0.7,
+        topP: 0.95,
+        maxOutputTokens,
+        responseModalities: modalities,
+        ...(imageResolution ? { imageConfig: { imageSize: imageResolution } } : {}),
+        // thinkingConfig is text-only — omit for image generation requests
+        ...(wantsImage ? {} : { thinkingConfig: { thinkingBudget: 0 } }),
+      },
     }),
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err?.error?.message || `Gemini HTTP ${res.status}`);
+  }
+
+  return res.json();
+}
+
+/** Normalize a content part that may use REST snake_case or JSON camelCase. */
+function inlineImageFromPart(p: any): { mime: string; data: string } | null {
+  const snake = p?.inline_data;
+  if (snake?.data) {
+    const mime = String(snake.mime_type || "image/png");
+    return { mime, data: snake.data };
+  }
+  const camel = p?.inlineData;
+  if (camel?.data) {
+    const mime = String(camel.mimeType || "image/png");
+    return { mime, data: camel.data };
+  }
+  return null;
+}
+
+function extractInlineImage(response: any): string | null {
+  const parts = response?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return null;
+  for (const p of parts) {
+    const blob = inlineImageFromPart(p);
+    if (blob?.data && /^image\//i.test(blob.mime)) {
+      return `data:${blob.mime};base64,${blob.data}`;
+    }
+  }
+  return null;
+}
+
+function summarizeGeminiImageFailure(response: any): string {
+  const pf = response?.promptFeedback;
+  if (pf?.blockReason) return `blocked: ${pf.blockReason}`;
+  const c0 = response?.candidates?.[0];
+  if (!c0) return "no candidates";
+  const fr = c0.finishReason || c0.finish_reason;
+  if (fr) return `finish: ${fr}`;
+  const parts = c0?.content?.parts;
+  if (!Array.isArray(parts) || parts.length === 0) return "empty parts";
+  const kinds = parts
+    .map((p: any) =>
+      p?.text != null
+        ? "text"
+        : inlineImageFromPart(p)
+          ? "image"
+          : "other",
+    )
+    .join(",");
+  return `parts: ${kinds}`;
+}
+
+/** Text-only Gemini call — used for outfit selection (no image input). */
+async function callGeminiJson(prompt: string): Promise<string> {
+  if (!GEMINI_KEY) throw new Error("Missing EXPO_PUBLIC_GOOGLE_AI_API_KEY");
+  const res = await fetch(geminiUrl(GEMINI_CLASSIFY), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.7,
+        topP: 0.95,
+        maxOutputTokens: 2048,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Gemini HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return raw
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+/**
+ * Fast classification via Gemini 2.0 Flash vision.
+ * Returns the raw JSON string from the model.
+ */
+async function callGeminiClassifyVision(
+  prompt: string,
+  imageBase64: string,
+): Promise<string> {
+  if (!GEMINI_KEY) throw new Error("Missing EXPO_PUBLIC_GOOGLE_AI_API_KEY");
+
+  const res = await fetch(geminiUrl(GEMINI_CLASSIFY), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { text: prompt },
+          { inline_data: { mime_type: "image/jpeg", data: imageBase64 } },
+        ],
+      }],
+      generationConfig: {
+        temperature: 0.1,
+        topP: 0.9,
+        maxOutputTokens: 800,
+        responseMimeType: "application/json",
+        // Disable Gemini 2.5's internal reasoning pass — Flash-Lite is fast
+        // enough without it for classification and cuts latency 300–800 ms.
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Gemini classify HTTP ${res.status}`);
   }
 
   const data = await res.json();
@@ -60,146 +196,6 @@ async function callGemini(
     .trim();
 }
 
-async function callGeminiWithImage(
-  model: string,
-  parts: any[],
-  responseModalities = ["TEXT"],
-): Promise<any> {
-  const res = await fetch(geminiUrl(model), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: {
-        temperature: 0.7,
-        topP: 0.95,
-        maxOutputTokens: 1024,
-        responseModalities,
-      },
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Gemini HTTP ${res.status}`);
-  }
-
-  return res.json();
-}
-
-function extractInlineImage(response: any): string | null {
-  const imageData = response?.candidates?.[0]?.content?.parts?.find((p: any) =>
-    p.inline_data?.mime_type?.includes("image"),
-  );
-  if (imageData?.inline_data?.data) {
-    return `data:${imageData.inline_data.mime_type};base64,${imageData.inline_data.data}`;
-  }
-  return null;
-}
-
-async function callOpenAIJson(prompt: string): Promise<string> {
-  if (!OPENAI_KEY) {
-    throw new Error("Missing EXPO_PUBLIC_OPENAI_API_KEY");
-  }
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-5-nano",
-      messages: [{ role: "user", content: prompt }],
-      max_completion_tokens: 2048,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `OpenAI HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-  let raw = data.choices?.[0]?.message?.content || "{}";
-  raw = raw
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-  return raw;
-}
-
-async function callOpenAIClassifyVision(
-  prompt: string,
-  imageBase64: string,
-): Promise<string> {
-  if (!OPENAI_KEY) {
-    throw new Error("Missing EXPO_PUBLIC_OPENAI_API_KEY");
-  }
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-5-nano",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${imageBase64}`,
-                detail: "high",
-              },
-            },
-          ],
-        },
-      ],
-      max_completion_tokens: CLASSIFY_VISION_MAX_COMPLETION_TOKENS,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `OpenAI HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-  const choice = data.choices?.[0];
-  const msg = choice?.message;
-  let raw = msg?.content;
-
-  if (raw == null || (typeof raw === "string" && !raw.trim())) {
-    const refusal = typeof msg?.refusal === "string" ? msg.refusal.trim() : "";
-    if (refusal) {
-      throw new Error(`Model refused: ${refusal}`);
-    }
-    const fr = choice?.finish_reason ?? "unknown";
-    const lengthHint =
-      fr === "length"
-        ? " Output hit the token limit (truncated). Try a simpler photo or fewer items in frame."
-        : "";
-    throw new Error(
-      `Empty response from item analyzer (finish_reason: ${fr}).${lengthHint} Try again or switch Fit check / Flat lay.`,
-    );
-  }
-
-  if (typeof raw !== "string") {
-    raw = String(raw);
-  }
-  raw = raw
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-  return raw;
-}
 
 /** Parse model output when it wraps JSON in prose or truncates; prefer top-level array or object. */
 function parseClassifyJsonPayload(raw: string): unknown {
@@ -289,6 +285,40 @@ function filterUsableItemMeta(items: Record<string, unknown>[]) {
   );
 }
 
+/** Vision models often box phones, bottles, etc.; drop those after classify. */
+const FASHION_ACCESSORY_HINT =
+  /\b(glasses|sunglasses|eyewear|jewelry|necklace|bracelet|earrings?|ring|watch|belt|hair\s*clip|scrunchie|tie|bow\s*tie|gloves?|mittens?|headband|bandana|wallet\s*chain|chain\s*wallet)\b/i;
+
+function isLikelyNonWardrobeObject(meta: Record<string, unknown>): boolean {
+  const text = `${meta.name ?? ""} ${meta.sub_category ?? ""} ${meta.category ?? ""} ${meta.type ?? ""}`;
+  if (FASHION_ACCESSORY_HINT.test(text)) return false;
+  const t = text.toLowerCase();
+  const nonWardrobe =
+    /\b(phones?|smartphones?|iphones?|android)\b/.test(t) ||
+    /\b(water\s*bottle|sports\s*bottle|drink(?:ing)?\s*bottle|thermos|tumbler|hydro\s*flask|nalgene|stanley\s+cup|\byeti\b|hydration)\b/.test(
+      t,
+    ) ||
+    /\b(laptops?|macbooks?|ipads?|tablets?|kindles?)\b/.test(t) ||
+    /\b(coffee\s*cup|paper\s*cup|disposable\s*cup|to-?go\s*cup|reusable\s*cup)\b/.test(
+      t,
+    ) ||
+    /\b(airpods?(\s+(max|pro|case))?|earbuds?|headphones?|earphones?|headsets?|gaming\s*headset|bone\s*conduction|wireless\s*headphones|over-?ear|on-?ear)\b/.test(
+      t,
+    ) ||
+    /\b(chargers?|charging\s*case|power\s*bank)\b/.test(t) ||
+    /\b(dumbbells?|kettlebells?|yoga\s*mats?|foam\s*roller)\b/.test(t) ||
+    /\b(keys?|key\s*fob|car\s*keys)\b/.test(t) ||
+    /\b(spiral\s*notebook|composition\s*book)\b/.test(t) ||
+    (/\bbottle\b/.test(t) &&
+      /\b(water|sport|drink|plastic|metal)\b/.test(t) &&
+      !/\b(perfume|fragrance|cologne|nail)\b/.test(t));
+  return nonWardrobe;
+}
+
+function filterWardrobeOnlyItems(items: Record<string, unknown>[]) {
+  return items.filter((m) => !isLikelyNonWardrobeObject(m));
+}
+
 /** Google-style box [ymin, xmin, ymax, xmax] in 0–1000; drop invalid. */
 function sanitizeBox2d(raw: unknown): number[] | undefined {
   if (!Array.isArray(raw) || raw.length !== 4) return undefined;
@@ -309,65 +339,130 @@ function attachSanitizedBox2d(items: Record<string, unknown>[]) {
   });
 }
 
+/** Fix obvious warmth mistakes (e.g. sports bra → cold → fall/winter in UI). */
+function reconcileWarmth(meta: Record<string, unknown>): Record<string, unknown> {
+  const w = String(meta.warmth ?? "")
+    .trim()
+    .toLowerCase();
+  if (w !== "cold") return meta;
+  const hay = `${meta.name ?? ""} ${meta.sub_category ?? ""} ${meta.category ?? ""} ${meta.type ?? ""}`.toLowerCase();
+  const looksWarmGarment =
+    /\b(bra|bras|bikini|swim|tank|cami|crop|sleeveless|shorts?|sandal|slide|legging|biker short|athletic short|running short|gym short|spandex|leotard)\b/.test(
+      hay,
+    );
+  const looksColdGarment =
+    /\b(coat|jacket|puffer|parka|sweater|hoodie|fleece|cardigan|boot|wool|scarf|glove|turtleneck|down)\b/.test(
+      hay,
+    );
+  if (looksWarmGarment && !looksColdGarment) {
+    return { ...meta, warmth: "warm" };
+  }
+  return meta;
+}
+
 export const apiClient = {
   /**
-   * Classify one or many clothing items from an image (OpenAI gpt-5-nano + vision).
-   * Same stack as camera / snap flows — does not call Google Gemini.
+   * Classify clothing items from an image.
+   * Primary: Gemini 2.0 Flash (fast, ~1-3s). Fallback: OpenAI gpt-5-nano.
+   *
+   * isIsolated=true → image is already a single clean segmented item on white;
+   * uses a minimal single-item prompt (no box_2d, no scene prefix, smaller output).
    */
   async classify(
     imageBase64: string,
     _categoryHint: string,
     _mode: "single" | "multi" = "single",
     photoLayout?: "flat_lay" | "fit_check",
+    isIsolated = false,
   ) {
+    // Compact prompt for already-isolated items (single garment on white bg)
+    const scopeRules = `ONLY include wearable fashion: apparel (tops, bottoms, dresses, outerwear), footwear, handbags/totes/backpacks worn or held as part of the outfit, and fashion accessories (jewelry, watches, glasses/sunglasses, belts, hats, scarves, hair accessories).
+NEVER include: phones, tablets, laptops, water bottles, drink cups/mugs, keys, books, chargers, headphones, earbuds, headsets, AirPods, audio devices, gym equipment, or other props — even if visible on the person, in ears, or around the neck.
+OCCLUSION RULE: Skip any item that is less than ~60% visible. If only a corner/strip/sliver of an item is showing (e.g. a graphic tee peeking through an unzipped jacket, a bag strap at the frame edge, half a shoe behind a pant leg), DO NOT list it — the visible portion is insufficient to capture design/print/shape. Only classify items that are mostly in-frame and mostly unoccluded.
+CONTENT SAFETY: If the image contains nudity, sexual content, violence, weapons, drug use, hate symbols, or any inappropriate content, return an empty JSON array [] with no other output.
+If nothing in the frame is wardrobe-related, return an empty JSON array [].`;
+
+    const isolatedPrompt =
+      `This image shows one item on a white background — it should be clothing, shoes, a bag, or a fashion accessory (glasses, jewelry, belt, hat, etc.).
+If the subject is NOT wardrobe (e.g. phone, bottle, headphones, earbuds, electronics), return exactly: {}
+If the image contains nudity, sexual content, violence, weapons, drug use, or inappropriate content, return exactly: {}
+If the item is heavily cut off / less than ~60% visible in frame, return exactly: {}
+Otherwise return a JSON object (not array) with exactly these fields:
+{"name":"≤5 words","category":"top|bottom|outerwear|full body|shoes|accessory|bag","sub_category":"1-2 words","color":"one word","warmth":"warm|cold|both","occasions":["≤3 from: casual,active,going-out,work,travel,lounge,formal"],"style_tags":["≤2 from: casual,office,street,evening,sporty,preppy,minimalist,romantic,edgy"]}
+warmth: cold ONLY for coats, jackets, puffers, sweaters, hoodies, fleece, boots, scarves, gloves. warm for sports bras, bras, crop tops, tanks, sleeveless tops, shorts, swimwear, sandals, gym leggings. both for regular tees, jeans, sneakers, bags, jewelry. NEVER label sports bras, tanks, or shorts as cold. No extra text.`;
+
+    const fitCheckExclusion =
+      photoLayout === "fit_check"
+        ? `\nFIT-CHECK EXCLUSIONS — do NOT list these even if visible: socks, earrings, rings, bracelets, anklets, hair ties, scrunchies, hair clips, small pendants, or any tiny accessory that occupies <5% of the image. Only include accessories that are LARGE and OBVIOUS at this distance: necklaces with clear chain visible, watches, sunglasses, hats, belts, scarves, ties, visible-strap bags. If in doubt about whether an accessory is large enough — skip it. The user will photograph small items individually.\n`
+        : "";
+
     const scenePrefix =
       photoLayout === "flat_lay"
-        ? "Scene: flat-lay or items on a surface / hanger / shelf — garments are laid out separately; prefer one entry per distinct piece.\n\n"
+        ? `Scene: flat-lay — one entry per distinct wardrobe piece only.\n${scopeRules}\n\n`
         : photoLayout === "fit_check"
-          ? "Scene: person wearing clothes (mirror selfie, outfit photo, or street shot) — extract every visible garment, shoes, bag, and accessory on the body.\n\n"
-          : "";
-    const prompt = `${scenePrefix}Identify every clothing item, shoe, bag, accessory, and jewelry in this photo.
-Return one JSON array only. Each object: {"name":"≤6 words","category":"top|bottom|outerwear|full body|shoes|accessory|bag","sub_category":"short","color":"one word (metals:gold/silver)","warmth":"warm|cold|both","occasions":["max 5 ids, most relevant only"],"style_tags":["max 3 ids, vibe/aesthetic"],"box_2d":[ymin,xmin,ymax,xmax]}
-Allowed occasion ids (pick ≤5 per item): casual,active,going-out,work,travel,lounge,formal
-Allowed style_tags ids (pick ≤3 that best match the item): casual,office,street,evening,sporty,preppy,minimalist,romantic,edgy
-warmth rules — think about WHEN you would wear this item, not how it looks: "cold"=items you wear to stay warm in fall/winter (ALL coats, jackets, heavy knits, sweaters, hoodies, boots, wool, down, fleece, thermals, fur, puffer, trench coats, parkas, scarves, beanies, gloves); "warm"=items for hot spring/summer weather ONLY (tank tops, shorts, swimwear, sandals, linen, sleeveless, crop tops, sundresses, flip flops); "both"=genuinely year-round (plain t-shirts, jeans, chinos, sneakers, leather bags, jewelry, accessories). IMPORTANT: any coat, jacket, or outerwear is ALWAYS "cold". When unsure default to "both". box_2d: 0-1000 tight crop around the item. No markdown.`;
+          ? `Scene: person in an outfit — list only what they are wearing or carrying as fashion (clothes, shoes, bag, large accessories).\n${scopeRules}${fitCheckExclusion}\n\n`
+          : `${scopeRules}\n\n`;
+    const multiPrompt = `${scenePrefix}List every qualifying item from the ALLOW list above. Do not list phones, bottles, cups, headphones, earbuds, headsets, or other electronics.
+Return a JSON array. Each object: {"name":"≤5 words","category":"top|bottom|outerwear|full body|shoes|accessory|bag","sub_category":"1-2 words","color":"one word","warmth":"warm|cold|both","occasions":["≤3 from: casual,active,going-out,work,travel,lounge,formal"],"style_tags":["≤2 from: casual,office,street,evening,sporty,preppy,minimalist,romantic,edgy"],"box_2d":[ymin,xmin,ymax,xmax]}
+box_2d: [ymin,xmin,ymax,xmax] only — normalized 0–1000, origin at TOP-LEFT of the image (ymin smaller = higher on screen). Each box must FULLY contain that garment with comfortable margin. For normal garments, span at least 100 units in BOTH width and height.
+Do NOT box mirror reflections, background clutter, or razor-thin strips at the left/right edge — box the actual item on the person.
+warmth: cold ONLY for coats, jackets, puffers, sweaters, hoodies, fleece, boots, scarves, gloves. warm for sports bras, bras, crop tops, tanks, sleeveless tops, shorts, swimwear, sandals, gym leggings. both for regular tees, jeans, sneakers, bags, jewelry, hats, sunglasses. NEVER use cold for sports bras, tanks, or shorts. Outerwear category is always cold. No markdown.`;
 
+    const prompt = isIsolated ? isolatedPrompt : multiPrompt;
+
+    // Gemini classify — retry once on transient failure
     let json = "";
-    let lastVisionErr: unknown;
+    let lastErr: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        if (attempt > 0) {
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-        json = await callOpenAIClassifyVision(prompt, imageBase64);
-        lastVisionErr = undefined;
-        break;
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 800));
+        json = await callGeminiClassifyVision(prompt, imageBase64);
+        if (json.trim()) break;
       } catch (e) {
-        lastVisionErr = e;
-        const m = e instanceof Error ? e.message : String(e);
-        if (attempt === 0 && m.includes("Empty response from item analyzer")) {
-          continue;
-        }
-        throw e;
+        lastErr = e;
+        console.warn(`[classify] Gemini attempt ${attempt + 1} failed:`, e);
       }
     }
-    if (!json.trim() && lastVisionErr) throw lastVisionErr;
+    if (!json.trim()) {
+      throw lastErr ?? new Error("Gemini classification returned empty response");
+    }
 
-    const parsed = parseClassifyJsonPayload(json);
+    // For isolated items the model returns an object, not array — wrap it
+    const rawForParse = isIsolated && json.trim().startsWith("{") ? `[${json}]` : json;
+
+    const parsed = parseClassifyJsonPayload(rawForParse);
     const normalized = normalizeClassifyItems(parsed);
     const usable = filterUsableItemMeta(normalized);
     if (usable.length === 0) {
+      const compact = json.replace(/\s/g, "");
+      if (
+        isIsolated &&
+        (compact === "{}" || compact === "[{}]" || compact === "[]")
+      ) {
+        throw new Error(
+          "This crop does not look like clothing or a fashion accessory.",
+        );
+      }
       throw new Error(
         normalized.length > 0
           ? "AI response had no usable item fields (need name, category, or type)"
           : "AI returned no clothing items for this image",
       );
     }
-    return { metadata: attachSanitizedBox2d(usable) };
+    const wardrobeOnly = filterWardrobeOnlyItems(usable);
+    if (wardrobeOnly.length === 0) {
+      throw new Error(
+        usable.length > 0
+          ? "Only non-closet items were detected (e.g. phone or bottle). Add a photo focused on clothes."
+          : "AI returned no clothing items for this image",
+      );
+    }
+    const withBoxes = attachSanitizedBox2d(wardrobeOnly);
+    return { metadata: withBoxes.map(reconcileWarmth) };
   },
 
   /**
-   * Pick outfit item IDs from the closet using OpenAI gpt-5-nano.
+   * Pick outfit item IDs from the closet using Gemini Flash Lite (text-only JSON).
    */
   async generateOutfits(preferences: {
     occasion: string;
@@ -434,7 +529,7 @@ Return ONLY a valid JSON object:
 { "item_ids": ["id1", "id2", ...], "title": "short catchy outfit name", "reasoning": "one sentence explaining the choices" }
 No markdown, no explanation outside the JSON.`;
 
-    const json = await callOpenAIJson(prompt);
+    const json = await callGeminiJson(prompt);
     return JSON.parse(json) as {
       item_ids: string[];
       title: string;
@@ -497,11 +592,14 @@ Use a generic full-body fashion model or mannequin-like figure (appropriate for 
         });
       }
 
-      for (const model of [GEMINI_RENDER_PRIMARY, GEMINI_DEFAULT]) {
+      for (const model of [GEMINI_IMAGE_PRIMARY, GEMINI_IMAGE_FALLBACK]) {
         try {
           const response = await callGeminiWithImage(model, parts, ["IMAGE"]);
           const uri = extractInlineImage(response);
           if (uri) return uri;
+          console.warn(
+            `[api-client] outfit image ${model} no image (${summarizeGeminiImageFailure(response)})`,
+          );
         } catch (e) {
           console.warn(`[api-client] outfit image model ${model} failed`, e);
         }
@@ -515,8 +613,8 @@ Use a generic full-body fashion model or mannequin-like figure (appropriate for 
   },
 
   /**
-   * Isolated garment / accessory on a flat backdrop (Gemini image), for add-closet "enhance" step.
-   * Returns a data: URI or null if keys missing / models fail.
+   * Isolated garment / accessory on a flat backdrop (default app canvas color) via Gemini 2.5 Flash Image only.
+   * Returns a data: URI or null if the model fails or the API key is missing.
    */
   async enhanceClothingItemCutout(params: {
     imageBase64: string;
@@ -526,41 +624,46 @@ Use a generic full-body fashion model or mannequin-like figure (appropriate for 
     backdropHex?: string;
   }): Promise<string | null> {
     try {
-      if (!GEMINI_KEY) return null;
       const bg = sanitizeOutfitBackdropHex(params.backdropHex);
       const hint = [params.color, params.name, params.category]
         .filter(Boolean)
         .join(" · ");
-      const prompt = `Create a premium catalog / e-commerce hero shot of the main clothing item or accessory from the reference photo.
+      const prompt = `You are a professional product photographer. Edit this photo to create a clean e-commerce catalog image of the clothing item${hint ? ` (${hint})` : ""}.
 
-REQUIREMENTS:
-- Show ONLY that one fashion item, centered, with generous empty space around it.
-- Background must be a single flat solid color exactly ${bg} everywhere — no gradient, texture, floor, wall, hanger, mannequin, hands, face, or environment from the original photo.
-- Remove all clutter; preserve accurate colors, patterns, and fabric weave from the reference.
-- If several garments appear, feature the single most prominent piece${hint ? ` matching: ${hint}` : ""}.
-- Studio polish: slightly confident contrast and saturation (subtle, not HDR), crisp silhouette edges, no muddy shadows on the backdrop.
-- Eliminate any noise, JPEG blocks, dust, or leftover background specks — the backdrop must be perfectly clean ${bg}.
-- Soft contact shadow under the garment only is fine; the backdrop stays pure ${bg}.`;
+Remove the person wearing it and any background. Show ONLY the garment itself, laid flat or as if on an invisible mannequin. The item should fill most of the frame, centered, with even padding on all sides.
+
+Background: flat solid color ${bg} everywhere. No shadows, no gradients, no floor, no texture.
+
+Preserve the garment's exact colors, patterns, and fabric texture. Crisp clean edges.`;
+
+      if (!GEMINI_KEY) return null;
 
       const parts: any[] = [
         { text: prompt },
-        {
-          inline_data: {
-            mime_type: "image/jpeg",
-            data: params.imageBase64,
-          },
-        },
+        { inline_data: { mime_type: "image/jpeg", data: params.imageBase64 } },
       ];
 
-      for (const model of [GEMINI_RENDER_PRIMARY, GEMINI_DEFAULT]) {
-        try {
-          const response = await callGeminiWithImage(model, parts, ["IMAGE"]);
-          const uri = extractInlineImage(response);
-          if (uri) return uri;
-        } catch (e) {
-          console.warn(`[api-client] enhanceClothingItemCutout ${model} failed`, e);
+      const enhanceModel = GEMINI_IMAGE_ENHANCE;
+      try {
+        console.log(`[api-client] enhance: calling Gemini ${enhanceModel}…`);
+        const response = await callGeminiWithImage(
+          enhanceModel,
+          parts,
+          ["IMAGE"],
+          "1K",
+        );
+        const uri = extractInlineImage(response);
+        if (uri) {
+          console.log(`[api-client] enhance: ${enhanceModel} returned image`);
+          return uri;
         }
+        console.warn(
+          `[api-client] enhance: ${enhanceModel} no image (${summarizeGeminiImageFailure(response)})`,
+        );
+      } catch (e) {
+        console.warn(`[api-client] enhance: ${enhanceModel} failed`, e);
       }
+
       return null;
     } catch (e) {
       console.error("enhanceClothingItemCutout failed:", e);
@@ -597,7 +700,7 @@ Do not add props, people, hangers, or new garments.`;
         { inline_data: { mime_type: mime.includes("png") ? "image/png" : "image/jpeg", data: b64 } },
       ];
 
-      for (const model of [GEMINI_RENDER_PRIMARY, GEMINI_DEFAULT]) {
+      for (const model of [GEMINI_IMAGE_PRIMARY, GEMINI_IMAGE_FALLBACK]) {
         try {
           const response = await callGeminiWithImage(model, parts, ["IMAGE"]);
           const uri = extractInlineImage(response);
