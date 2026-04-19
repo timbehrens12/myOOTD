@@ -829,7 +829,7 @@ public class ClothingIsolatorModule: Module {
         } else {
           tight = norm
         }
-        guard let squared = padTightTransparent(garment: tight, padFraction: 0.05)
+        guard let squared = padTightTransparent(garment: tight, padFraction: 0.02)
         else { continue }
 
         if let cgOut = ciContext.createCGImage(squared, from: squared.extent),
@@ -1472,7 +1472,7 @@ public class ClothingIsolatorModule: Module {
     } else {
       tight = norm
     }
-    guard let out = padTightTransparent(garment: tight, padFraction: 0.05)
+    guard let out = padTightTransparent(garment: tight, padFraction: 0.02)
     else { return nil }
     guard let cgOut = context.createCGImage(out, from: out.extent),
           let png = UIImage(cgImage: cgOut).pngData()

@@ -80,13 +80,22 @@ function CrossfadeThumbImage({
   uri,
   style,
   resizeMode = "contain",
+  selfAspect = false,
 }: {
   uri: string;
   style: StyleProp<ViewStyle>;
   resizeMode?: "contain" | "cover";
+  // When true, reads the image's natural dimensions and applies them as
+  // `aspectRatio` on the outer View — the card shapes itself around the
+  // garment so contain-mode has no wasted bands. Clamped to [0.55, 1.4] so
+  // extreme-aspect items (long pants, wide belts) don't blow up row height.
+  selfAspect?: boolean;
 }) {
   const [prevUri, setPrevUri] = useState<string | null>(null);
   const [curUri, setCurUri] = useState<string>(uri);
+  // Seed with 4:5 portrait (typical garment) so card has a sensible height
+  // before Image.getSize resolves — prevents a zero-height flash on mount.
+  const [aspect, setAspect] = useState<number | undefined>(selfAspect ? 0.8 : undefined);
   const topOpacity = useSharedValue(1);
 
   useEffect(() => {
@@ -101,10 +110,33 @@ function CrossfadeThumbImage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uri]);
 
+  useEffect(() => {
+    if (!selfAspect || !curUri) return;
+    let cancelled = false;
+    Image.getSize(
+      curUri,
+      (w, h) => {
+        if (cancelled || w <= 0 || h <= 0) return;
+        const raw = w / h;
+        setAspect(Math.max(0.55, Math.min(1.4, raw)));
+      },
+      () => { /* ignore */ },
+    );
+    return () => { cancelled = true; };
+  }, [curUri, selfAspect]);
+
   const topStyle = useAnimatedStyle(() => ({ opacity: topOpacity.value }));
 
   return (
-    <View style={[style, { overflow: "hidden", backgroundColor: "#fff" }]}>
+    <View
+      style={[
+        style,
+        selfAspect && aspect
+          ? { aspectRatio: aspect, height: undefined }
+          : null,
+        { overflow: "hidden", backgroundColor: "#fff" },
+      ]}
+    >
       {prevUri ? (
         <Image
           source={{ uri: prevUri }}
@@ -2374,7 +2406,8 @@ export default function AddScreen() {
                     <CrossfadeThumbImage
                       uri={item.sourceUri}
                       style={styles.isolatedThumbImg}
-                      resizeMode="cover"
+                      resizeMode="contain"
+                      selfAspect
                     />
                     {item._classifying && (
                       <View style={styles.classifyingBadge}>
@@ -3905,7 +3938,7 @@ const styles = StyleSheet.create({
   },
   isolatedThumb: {
     width: 140,
-    alignSelf: "stretch",
+    alignSelf: "center", // shrinks to image height so card hugs the garment with no bands
     backgroundColor: "#F5F1EC", // warm neutral — matches competitor's non-white card tone
     justifyContent: "center",
     alignItems: "center",
