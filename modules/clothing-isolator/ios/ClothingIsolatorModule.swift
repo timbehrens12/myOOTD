@@ -344,6 +344,30 @@ public class ClothingIsolatorModule: Module {
     return placed.composited(over: clearSquare).cropped(to: CGRect(x: 0, y: 0, width: side, height: side))
   }
 
+  /// Output `garment` wrapped in a transparent canvas that's `padFraction`
+  /// larger on each side. The canvas aspect == garment aspect (with tiny pad),
+  /// so displaying the result with `resizeMode=contain` in a card puts the
+  /// garment nearly edge-to-edge — only card vs. garment aspect mismatch
+  /// produces bands. The 2% default is for anti-aliased mask edges.
+  private func padTightTransparent(garment: CIImage, padFraction: CGFloat) -> CIImage? {
+    let e = garment.extent
+    guard e.width >= 1, e.height >= 1, e.width.isFinite, e.height.isFinite,
+          padFraction >= 0, padFraction < 0.5 else { return nil }
+    let padX = e.width * padFraction
+    let padY = e.height * padFraction
+    let canvasRect = CGRect(
+      x: 0, y: 0,
+      width: e.width + padX * 2,
+      height: e.height + padY * 2
+    )
+    let clear = ciClearImage(extent: canvasRect)
+    // Shift garment so (0,0) maps to (padX, padY) inside the canvas.
+    let placed = garment.transformed(
+      by: CGAffineTransform(translationX: padX - e.origin.x, y: padY - e.origin.y)
+    )
+    return placed.composited(over: clear).cropped(to: canvasRect)
+  }
+
   /// Fit `garment` onto a fixed `canvasWidth`×`canvasHeight` transparent canvas
   /// so the garment's longer axis always takes `garmentFillRatio` × the matching
   /// canvas axis. Result: uniform visual size and centering across item types —
@@ -674,8 +698,8 @@ public class ClothingIsolatorModule: Module {
     }
 
     // 2) 8% pad (Aesty-style breathing room).
-    let padX = trimmed.extent.width * 0.08
-    let padY = trimmed.extent.height * 0.08
+    let padX = trimmed.extent.width * 0.01
+    let padY = trimmed.extent.height * 0.01
     let paddedRect = CGRect(
       x: -padX, y: -padY,
       width: trimmed.extent.width + padX * 2,
@@ -748,7 +772,7 @@ public class ClothingIsolatorModule: Module {
     let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     // Small outward inset so anti-aliased mask edges aren't clipped — auto-trim
     // below reclaims the tight bbox, so large paddings here just waste frame space.
-    let padding: CGFloat = 0.05
+    let padding: CGFloat = 0.01
 
     var results: [String] = []
 
@@ -784,10 +808,8 @@ public class ClothingIsolatorModule: Module {
 
         let polished = polish(image: shifted)
 
-        // Tight-trim alpha → fit into fixed 4:5 canvas where the garment's
-        // longer axis always takes 85% of the matching canvas axis. Uniform
-        // zoom/centering across every item type — the crux of Aesty-style
-        // previews.
+        // Tight-trim alpha + 2% safety pad, image aspect = garment aspect.
+        // Maximizes card fill when displayed with resizeMode=contain.
         let norm = polished.transformed(
           by: CGAffineTransform(
             translationX: -polished.extent.origin.x,
@@ -807,12 +829,8 @@ public class ClothingIsolatorModule: Module {
         } else {
           tight = norm
         }
-        guard let squared = fitGarmentCentered(
-          garment: tight,
-          canvasWidth: kCutoutSquareSide,
-          canvasHeight: kCutoutSquareSide * 1.25,
-          garmentFillRatio: 0.85
-        ) else { continue }
+        guard let squared = padTightTransparent(garment: tight, padFraction: 0.05)
+        else { continue }
 
         if let cgOut = ciContext.createCGImage(squared, from: squared.extent),
            let png = UIImage(cgImage: cgOut).pngData() {
@@ -1128,7 +1146,7 @@ public class ClothingIsolatorModule: Module {
     let sourceCI = CIImage(cgImage: cgImage)
     let imgW = CGFloat(cgImage.width)
     let imgH = CGFloat(cgImage.height)
-    let padding: CGFloat = 0.18
+    let padding: CGFloat = 0.02
     let sourceHasAlpha = cgImageHasAlpha(cgImage)
 
     var results: [String] = []
@@ -1220,7 +1238,7 @@ public class ClothingIsolatorModule: Module {
     let imgW = ow
     let imgH = oh
     let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    let padding: CGFloat = 0.18
+    let padding: CGFloat = 0.02
     var results: [String] = []
 
     for box in boxes {
@@ -1383,7 +1401,7 @@ public class ClothingIsolatorModule: Module {
     let imgW = CGFloat(cg.width)
     let imgH = CGFloat(cg.height)
     let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    let padding: CGFloat = 0.18
+    let padding: CGFloat = 0.02
     var results: [String] = []
     for box in boxes {
       guard box.count == 4, let cropRect = cropRect(for: box, imgW: imgW, imgH: imgH, padding: padding) else { continue }
@@ -1439,11 +1457,10 @@ public class ClothingIsolatorModule: Module {
     let norm = base.transformed(
       by: CGAffineTransform(translationX: -base.extent.origin.x, y: -base.extent.origin.y)
     )
-    // Tight-trim alpha (drop Vision slack) → consistent-size fit into a fixed
-    // 4:5 canvas where the garment's longer axis always takes 85% of the
-    // matching canvas axis. Uniform zoom/centering across every item: tall
-    // shirts ≈ 85% of canvas height, wide shoes ≈ 85% of canvas width, always
-    // centered, always same relative size.
+    // Tight-trim alpha (drop Vision slack), then pad 2% on each side (for AA
+    // edges) and output the image at the garment's OWN aspect. Contain-mode in
+    // the thumbnail card then shows the garment nearly edge-to-edge with only
+    // card-vs-garment aspect mismatch bands — no internal canvas padding wasted.
     let tight: CIImage
     if let trimRect = autoTrimAlpha(norm, context: context),
        trimRect.width >= 8, trimRect.height >= 8 {
@@ -1455,12 +1472,8 @@ public class ClothingIsolatorModule: Module {
     } else {
       tight = norm
     }
-    guard let out = fitGarmentCentered(
-      garment: tight,
-      canvasWidth: kCutoutSquareSide,                 // 1024
-      canvasHeight: kCutoutSquareSide * 1.25,         // 1280  → 4:5 portrait matches thumb card
-      garmentFillRatio: 0.85                          // longer axis = 85% of matching canvas axis
-    ) else { return nil }
+    guard let out = padTightTransparent(garment: tight, padFraction: 0.05)
+    else { return nil }
     guard let cgOut = context.createCGImage(out, from: out.extent),
           let png = UIImage(cgImage: cgOut).pngData()
     else { return nil }

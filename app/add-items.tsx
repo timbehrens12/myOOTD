@@ -237,14 +237,13 @@ function expandBoxForTopGarmentCrop(
   // Old 22% side + hard y-clamps were hacks for the full-body mask slicing approach.
   const up   = mode === "fit_check" ? 0.02 : 0.06;
   const down = mode === "fit_check" ? 0.02 : 0.05;
-  const side = mode === "fit_check" ? 0.08 : 0.22;
+  const side = mode === "fit_check" ? 0.25 : 0.22; // 25% side pad gives Vision context to drop background
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
   xmax = Math.min(1000, xmax + Math.round(w * side));
-  // NOTE: y-position clamps (ymin<288, ymax>538) removed. They assumed a specific
-  // full-body mirror-shot framing and caused wrong crops for seated / close-framed shots.
-  return ensureTopGarmentMinimumWidth([ymin, xmin, ymax, xmax]);
+  const expanded = [ymin, xmin, ymax, xmax];
+  return mode === "fit_check" ? expanded : ensureTopGarmentMinimumWidth(expanded);
 }
 
 /**
@@ -261,7 +260,7 @@ function expandBoxForBottomsGarmentCrop(
   // fit_check: reduced expansion — per-box Vision finds the pant boundaries precisely.
   const up   = mode === "fit_check" ? 0.04 : 0.06;
   const down = mode === "fit_check" ? 0.04 : 0.06;
-  const side = mode === "fit_check" ? 0.04 : 0.05;
+  const side = mode === "fit_check" ? 0.25 : 0.05; // Critical for removing bg between legs
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
@@ -295,7 +294,7 @@ function expandBoxForFullBodyGarmentCrop(
   const w = xmax - xmin;
   const up = mode === "fit_check" ? 0.04 : 0.06;
   const down = mode === "fit_check" ? 0.04 : 0.06;
-  const side = mode === "fit_check" ? 0.03 : 0.05;
+  const side = mode === "fit_check" ? 0.20 : 0.05;
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
@@ -350,49 +349,56 @@ function isSkippableOnFitCheck(meta: any): boolean {
  * mapped to the torso). Override the box based on where the item *must* be on a human body.
  * Returns [ymin, xmin, ymax, xmax] in 0–1000 coords, or null to use Gemini's box.
  */
-function fitCheckBoxOverride(meta: any): number[] | null {
-  const tags = Array.isArray(meta?.style_tags)
-    ? (meta.style_tags as unknown[]).join(" ")
-    : "";
-  const text =
-    `${meta?.category ?? ""} ${meta?.sub_category ?? ""} ${meta?.type ?? ""} ${meta?.name ?? ""} ${meta?.color ?? ""} ${tags}`
-      .toLowerCase()
-      .trim();
-  // Fixed body-position regions — user is framed head-to-feet in a mirror shot.
-  const hasHeadwear =
-    /\b(hat|cap|beanie|beret|visor|snapback|fedora|bucket\s*hat|baseball\s*cap)\b/.test(
-      text,
-    );
-  // Eyewear before hat when it’s clearly glasses (not “hat”); avoids shoulder boxes + “flat lens” → shoe bug.
-  const hasEyewear =
-    /\b(glasses|sunglasses|eyewear|spectacles|goggles|shades|sunnies|aviators?|wayfarers?)\b/.test(
-      text,
-    );
-  if (hasEyewear && !hasHeadwear) {
-    // Face-only crop: must stop at the NECK — the Vision mask covers the whole
-    // person, so any torso included in the box shows up as "chest, not glasses".
-    // For a standing full-body mirror shot the head sits at y≈40-230 (23% of frame).
-    // Center X at 500 (middle 32% of frame width).
-    return [40, 340, 240, 660];
-  }
+function fitCheckBoxAccessoryOverride(meta: any): number[] | null {
+  const tags = Array.isArray(meta?.style_tags) ? (meta.style_tags as unknown[]).join(" ") : "";
+  const text = `${meta?.category ?? ""} ${meta?.sub_category ?? ""} ${meta?.type ?? ""} ${meta?.name ?? ""} ${meta?.color ?? ""} ${tags}`.toLowerCase().trim();
+  
+  const hasHeadwear = /\b(hat|cap|beanie|beret|visor|snapback|fedora|bucket\s*hat|baseball\s*cap)\b/.test(text);
+  const hasEyewear = /\b(glasses|sunglasses|eyewear|spectacles|goggles|shades|sunnies|aviators?|wayfarers?)\b/.test(text);
+  
+  if (hasEyewear && !hasHeadwear) return [40, 340, 240, 660];
   if (hasHeadwear) return [0, 300, 240, 700];
-  // Neck jewelry / chains — neckline band just below the chin
   if (isNeckJewelryText(text)) return [230, 310, 400, 690];
-  // Ties / scarves / collars — taller region than a thin chain
-  if (/\b(collar|tie|bow\s*tie|necktie|scarf|bandana)\b/.test(text))
-    return [180, 280, 480, 720];
-  // Belt — waist band
+  if (/\b(collar|tie|bow\s*tie|necktie|scarf|bandana)\b/.test(text)) return [180, 280, 480, 720];
   if (/\bbelt\b/.test(text)) return [380, 300, 540, 700];
-  // Footwear — feet-forward, squarer so it fills the thumb
-  if (
-    /\b(shoe|shoes|sneaker|sneakers|trainer|trainers|boot|boots|heel|heels|sandal|sandals|loafer|loafers|footwear|cleat|cleats|oxford|oxfords|mule|mules|slipper|slippers|clog|clogs)\b/.test(
-      text,
-    )
-  ) {
-    // Bottom ~22% of frame — feet/ankles, not full pants (was too tall).
-    return [772, 48, 1000, 952];
-  }
+  // Footwear is purposely excluded so its dynamic box is preserved.
   return null;
+}
+
+function expandBoxForAccessoryCrop(
+  box: number[],
+  mode: "fit_check" | "flat_lay",
+): number[] {
+  let [ymin, xmin, ymax, xmax] = box;
+  if (xmax <= xmin || ymax <= ymin) return box;
+  const h = ymax - ymin;
+  const w = xmax - xmin;
+  const up = mode === "fit_check" ? 0.10 : 0.10;
+  const down = mode === "fit_check" ? 0.10 : 0.10;
+  const side = mode === "fit_check" ? 0.25 : 0.15;
+  ymin = Math.max(0, ymin - Math.round(h * up));
+  ymax = Math.min(1000, ymax + Math.round(h * down));
+  xmin = Math.max(0, xmin - Math.round(w * side));
+  xmax = Math.min(1000, xmax + Math.round(w * side));
+  return [ymin, xmin, ymax, xmax];
+}
+
+function expandBoxForFootwearCrop(
+  box: number[],
+  mode: "fit_check" | "flat_lay",
+): number[] {
+  let [ymin, xmin, ymax, xmax] = box;
+  if (xmax <= xmin || ymax <= ymin) return box;
+  const h = ymax - ymin;
+  const w = xmax - xmin;
+  const up = mode === "fit_check" ? 0.05 : 0.10;
+  const down = mode === "fit_check" ? 0.05 : 0.10;
+  const side = mode === "fit_check" ? 0.25 : 0.15;
+  ymin = Math.max(0, ymin - Math.round(h * up));
+  ymax = Math.min(1000, ymax + Math.round(h * down));
+  xmin = Math.max(0, xmin - Math.round(w * side));
+  xmax = Math.min(1000, xmax + Math.round(w * side));
+  return [ymin, xmin, ymax, xmax];
 }
 
 /** Tops / outerwear — includes classify `category` so “outerwear” isn’t missed when name lacks “jacket”. */
@@ -600,23 +606,16 @@ async function cropItemsForFitCheck(
       : items;
 
   const prepared = filtered.map((m: any) => {
-    if (!Array.isArray(m.box_2d) || m.box_2d.length !== 4) return m;
+    let activeBox = m.box_2d;
+    if (!Array.isArray(activeBox) || activeBox.length !== 4) return m;
 
     if (effectiveLayout === "fit_check") {
-      // Accessories (glasses, shoes, belt, hat, necklace): use body-position overrides
-      // because Gemini sometimes mis-boxes these on a full-body shot.
-      const override = fitCheckBoxOverride(m);
-      if (override) return { ...m, box_2d: override };
-
-      // All other fit-check items (tops, bottoms, outerwear, bags):
-      // Trust Gemini's box. Only guard against degenerate zero-area boxes.
-      // DO NOT call expandBoxForTopGarmentCrop — its forced minimum width (72% of
-      // frame height) and old y-clamps caused the head/pants bleed we're fixing.
-      const box = expandDegenerateBox2d(m.box_2d as number[], 60);
-      return { ...m, box_2d: box };
+      const override = fitCheckBoxAccessoryOverride(m);
+      if (override) {
+        activeBox = override;
+      }
     }
 
-    // ── flat_lay: keep existing expansion + Vision/bg-removal ───────────────
     const minSpan = isTinyAccessoryLike(m)
       ? MIN_BOX_2D_SPAN_ACCESSORY
       : isFullBodyCategory(m)
@@ -626,13 +625,21 @@ async function cropItemsForFitCheck(
           : isTopGarment(m)
             ? MIN_BOX_2D_SPAN_TOP_FLATLAY
             : MIN_BOX_2D_SPAN;
-    let box = expandDegenerateBox2d(m.box_2d as number[], minSpan);
+    
+    let box = expandDegenerateBox2d(activeBox as number[], minSpan);
+    
     if (isFullBodyCategory(m)) {
       box = expandBoxForFullBodyGarmentCrop(box, effectiveLayout);
+    } else if (isTopGarment(m)) {
+      box = expandBoxForTopGarmentCrop(box, effectiveLayout);
+    } else if (isBottomsLike(m)) {
+      box = expandBoxForBottomsGarmentCrop(box, effectiveLayout);
+    } else if (isShoeMeta(m)) {
+      box = expandBoxForFootwearCrop(box, effectiveLayout);
     } else {
-      if (isTopGarment(m)) box = expandBoxForTopGarmentCrop(box, effectiveLayout);
-      if (isBottomsLike(m)) box = expandBoxForBottomsGarmentCrop(box, effectiveLayout);
+      box = expandBoxForAccessoryCrop(box, effectiveLayout);
     }
+    
     return { ...m, box_2d: box };
   });
 
@@ -1144,6 +1151,16 @@ function warmthToSeasons(w: string | undefined): string[] {
     default:
       return ["all"];
   }
+}
+
+function seasonsToWarmth(seasons: string[]): string {
+  if (seasons.includes("all")) return "both";
+  const hasWarm = seasons.includes("spring") || seasons.includes("summer");
+  const hasCold = seasons.includes("fall") || seasons.includes("winter");
+  if (hasWarm && hasCold) return "both";
+  if (hasWarm) return "warm";
+  if (hasCold) return "cold";
+  return "both";
 }
 
 function isLibraryMenuIntent(raw: string | string[] | undefined): boolean {
@@ -1859,17 +1876,27 @@ export default function AddScreen() {
       return;
     }
 
-    const jpegUris: string[] = [];
-    for (const a of res.assets) {
-      try {
-        jpegUris.push(await ensureJpegUri(a.uri));
-      } catch (e) {
-        console.warn("[upload] JPEG transcode failed, using picker URI", e);
-        jpegUris.push(a.uri);
-      }
-    }
+    // Immediately trigger UI loading state so the user doesn't see a hung white screen
+    // while the HEIC -> JPEG transcoder bridges to native and blocks.
+    setUploadSource("library");
+    setStatus("analyzing");
+    setBatchAnalyze({ current: 0, total: res.assets.length });
+    setImage(res.assets[0].uri);
 
-    await analyzeAllLibraryPhotos(jpegUris);
+    // Defer the heavy transcoding to fully yield the thread so the UI can flush the loading view
+    setTimeout(async () => {
+      const jpegUris: string[] = [];
+      for (const a of res.assets) {
+        try {
+          jpegUris.push(await ensureJpegUri(a.uri));
+        } catch (e) {
+          console.warn("[upload] JPEG transcode failed, using picker URI", e);
+          jpegUris.push(a.uri);
+        }
+      }
+
+      await analyzeAllLibraryPhotos(jpegUris);
+    }, 400);
   };
 
   /** Pick photos from library and APPEND results to existing review list */
@@ -1913,100 +1940,108 @@ export default function AddScreen() {
     }
     if (res.canceled || res.assets.length === 0) return;
 
-    const jpegUris: string[] = [];
-    for (const a of res.assets) {
-      try {
-        jpegUris.push(await ensureJpegUri(a.uri));
-      } catch {
-        jpegUris.push(a.uri);
-      }
-    }
+    // Immediately trigger UI loading state
+    setUploadSource("library");
+    setStatus("analyzing");
+    setBatchAnalyze({ current: 0, total: res.assets.length });
+    setImage(res.assets[0].uri);
 
-    // Analyze and append — don't clear existing items
-    setBatchAnalyze({ current: 0, total: jpegUris.length });
-    for (let i = 0; i < jpegUris.length; i++) {
-      setBatchAnalyze({ current: i + 1, total: jpegUris.length });
-      const uri = jpegUris[i];
-      try {
-        const b64 = await uriToBase64(uri);
-        const segments = await segmentItems(b64);
-        const strategy = await decideUploadSegmentStrategy(segments, uri);
-        if (strategy === "per_segment") {
-          setAiMetaList((prev) => [
-            ...prev,
-            ...segments.map((seg) => ({
-              sourceUri: seg,
-              isIsolated: true,
-              _classifying: true,
-              name: "",
-            })),
-          ]);
-          await Promise.all(
-            segments.map(async (seg, si) => {
-              try {
-                const segB64 = await resizeForVision(seg);
-                const result = await apiClient.classify(
-                  segB64,
-                  "auto",
-                  "single",
-                  undefined,
-                  true,
-                );
-                const meta = Array.isArray(result.metadata)
-                  ? result.metadata[0]
-                  : result.metadata;
-                if (meta && typeof meta === "object") {
-                  setAiMetaList((prev) => {
-                    const idx = prev.findIndex(
-                      (p) => p.sourceUri === seg && p._classifying,
-                    );
-                    if (idx === -1) return prev;
-                    const next = [...prev];
-                    next[idx] = { ...meta, sourceUri: seg, isIsolated: true };
-                    return next;
-                  });
-                }
-              } catch (e) {
-                setAiMetaList((prev) =>
-                  prev.filter((p) => !(p.sourceUri === seg && p._classifying)),
-                );
-                console.warn("[upload] classify failed for segment", si, e);
-              }
-            }),
-          );
-          setAiMetaList((prev) =>
-            mergeShoeIsolatesForSegmentBatch(prev, segments),
-          );
-        } else if (strategy === "flat_lay_boxes") {
-          let cropped = await classifyAndCropBoxesFromPhoto(
-            uri,
-            b64,
-            null,
-            "flat_lay",
-          );
-          if (cropped.length === 0 && segments.length === 1 && segments[0]) {
-            const fb = await fallbackClassifySingleCutout(segments[0], uri);
-            cropped = fb ? [fb] : [];
-          }
-          for (const item of cropped) {
-            setAiMetaList((prev) => [...prev, item]);
-          }
-        } else {
-          const cropped = await classifyAndCropBoxesFromPhoto(
-            uri,
-            b64,
-            segments.length === 1 ? segments[0] : null,
-            "fit_check",
-          );
-          for (const item of cropped) {
-            setAiMetaList((prev) => [...prev, item]);
-          }
+    setTimeout(async () => {
+      const jpegUris: string[] = [];
+      for (const a of res.assets) {
+        try {
+          jpegUris.push(await ensureJpegUri(a.uri));
+        } catch {
+          jpegUris.push(a.uri);
         }
-      } catch (e) {
-        console.warn("[upload] addMore failed for photo", i + 1, e);
       }
-    }
-    setBatchAnalyze(null);
+
+      // Analyze and append — don't clear existing items
+      setBatchAnalyze({ current: 0, total: jpegUris.length });
+      for (let i = 0; i < jpegUris.length; i++) {
+        setBatchAnalyze({ current: i + 1, total: jpegUris.length });
+        const uri = jpegUris[i];
+        try {
+          const b64 = await uriToBase64(uri);
+          const segments = await segmentItems(b64);
+          const strategy = await decideUploadSegmentStrategy(segments, uri);
+          if (strategy === "per_segment") {
+            setAiMetaList((prev) => [
+              ...prev,
+              ...segments.map((seg) => ({
+                sourceUri: seg,
+                isIsolated: true,
+                _classifying: true,
+                name: "",
+              })),
+            ]);
+            await Promise.all(
+              segments.map(async (seg, si) => {
+                try {
+                  const segB64 = await resizeForVision(seg);
+                  const result = await apiClient.classify(
+                    segB64,
+                    "auto",
+                    "single",
+                    undefined,
+                    true,
+                  );
+                  const meta = Array.isArray(result.metadata)
+                    ? result.metadata[0]
+                    : result.metadata;
+                  if (meta && typeof meta === "object") {
+                    setAiMetaList((prev) => {
+                      const idx = prev.findIndex(
+                        (p) => p.sourceUri === seg && p._classifying,
+                      );
+                      if (idx === -1) return prev;
+                      const next = [...prev];
+                      next[idx] = { ...meta, sourceUri: seg, isIsolated: true };
+                      return next;
+                    });
+                  }
+                } catch (e) {
+                  setAiMetaList((prev) =>
+                    prev.filter((p) => !(p.sourceUri === seg && p._classifying)),
+                  );
+                  console.warn("[upload] classify failed for segment", si, e);
+                }
+              }),
+            );
+            setAiMetaList((prev) =>
+              mergeShoeIsolatesForSegmentBatch(prev, segments),
+            );
+          } else if (strategy === "flat_lay_boxes") {
+            let cropped = await classifyAndCropBoxesFromPhoto(
+              uri,
+              b64,
+              null,
+              "flat_lay",
+            );
+            if (cropped.length === 0 && segments.length === 1 && segments[0]) {
+              const fb = await fallbackClassifySingleCutout(segments[0], uri);
+              cropped = fb ? [fb] : [];
+            }
+            for (const item of cropped) {
+              setAiMetaList((prev) => [...prev, item]);
+            }
+          } else {
+            const cropped = await classifyAndCropBoxesFromPhoto(
+              uri,
+              b64,
+              segments.length === 1 ? segments[0] : null,
+              "fit_check",
+            );
+            for (const item of cropped) {
+              setAiMetaList((prev) => [...prev, item]);
+            }
+          }
+        } catch (e) {
+          console.warn("[upload] addMore failed for photo", i + 1, e);
+        }
+      }
+      setBatchAnalyze(null);
+    }, 400);
   };
 
   /** Open camera to capture more and append */
@@ -2221,6 +2256,7 @@ export default function AddScreen() {
                 color: editForm.color,
                 occasions: editForm.occasions,
                 seasons: editForm.seasons,
+                warmth: seasonsToWarmth(editForm.seasons),
               }
             : it,
         ),
@@ -2338,7 +2374,7 @@ export default function AddScreen() {
                     <CrossfadeThumbImage
                       uri={item.sourceUri}
                       style={styles.isolatedThumbImg}
-                      resizeMode="contain"
+                      resizeMode="cover"
                     />
                     {item._classifying && (
                       <View style={styles.classifyingBadge}>
@@ -3869,7 +3905,7 @@ const styles = StyleSheet.create({
   },
   isolatedThumb: {
     width: 140,
-    aspectRatio: 0.8, // 4:5 portrait — matches native output canvas so contain-fit has no dead bands
+    alignSelf: "stretch",
     backgroundColor: "#F5F1EC", // warm neutral — matches competitor's non-white card tone
     justifyContent: "center",
     alignItems: "center",
