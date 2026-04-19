@@ -1804,65 +1804,54 @@ export default function AddScreen() {
     }
   };
 
-  const persistItemsToCloset = async (
-    imageUri: string,
-    metas: any[],
-    userId: string,
-  ) => {
-    if (!userId) throw new Error("Not signed in");
-    if (metas.length === 0) throw new Error("No items to save");
-
-    const response = await fetch(imageUri);
-    const blob = await response.blob();
-
-    const arrayBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as ArrayBuffer);
-      reader.onerror = reject;
-      reader.readAsArrayBuffer(blob);
-    });
-
-    const { ext, contentType } = guessMimeFromImageUri(imageUri);
-    const fileName = `piece_${Date.now()}_${Math.random().toString(36).slice(2, 10)}.${ext}`;
-
-    const { error: storageError } = await supabase.storage
-      .from("clothing-images")
-      .upload(fileName, arrayBuffer, {
-        contentType,
-        upsert: true,
+  /** Upload one image to storage; return its public URL (or null on failure). */
+  const uploadImageForCloset = async (imageUri: string): Promise<string | null> => {
+    try {
+      const response = await fetch(imageUri);
+      const blob = await response.blob();
+      const arrayBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
+        reader.onerror = reject;
+        reader.readAsArrayBuffer(blob);
       });
-
-    if (storageError) throw storageError;
-
-    const {
-      data: { publicUrl },
-    } = supabase.storage.from("clothing-images").getPublicUrl(fileName);
-
-    const inserts = metas.map((meta) => ({
-      user_id: userId,
-      name: meta?.name || "New Piece",
-      image_url: publicUrl,
-      type: meta?.sub_category || meta?.category || "Piece",
-      category: meta?.category || "other",
-      sub_category: meta?.sub_category || null,
-      color: meta?.color || "Unknown",
-      material: null,
-      fit: null,
-      weight: null,
-      pattern: "solid",
-      style: "casual",
-      seasons: meta?.seasons || warmthToSeasons(meta?.warmth),
-      occasions: meta?.occasions || ["casual"],
-      formality: null,
-      box_2d: meta?.box_2d || null,
-      notes: null,
-      is_digitized: true,
-      image_url_original: meta?.image_url_original ?? null,
-    }));
-
-    const { error } = await supabase.from("clothing_items").insert(inserts);
-    if (error) throw error;
+      const { ext, contentType } = guessMimeFromImageUri(imageUri);
+      const fileName = `piece_${Date.now()}_${Math.random().toString(36).slice(2, 10)}.${ext}`;
+      const { error: storageError } = await supabase.storage
+        .from("clothing-images")
+        .upload(fileName, arrayBuffer, { contentType, upsert: true });
+      if (storageError) return null;
+      const {
+        data: { publicUrl },
+      } = supabase.storage.from("clothing-images").getPublicUrl(fileName);
+      return publicUrl;
+    } catch {
+      return null;
+    }
   };
+
+  /** Build the row shape for a single meta entry against an uploaded image URL. */
+  const buildClothingItemRow = (meta: any, imageUrl: string, userId: string) => ({
+    user_id: userId,
+    name: meta?.name || "New Piece",
+    image_url: imageUrl,
+    type: meta?.sub_category || meta?.category || "Piece",
+    category: meta?.category || "other",
+    sub_category: meta?.sub_category || null,
+    color: meta?.color || "Unknown",
+    material: null,
+    fit: null,
+    weight: null,
+    pattern: "solid",
+    style: "casual",
+    seasons: meta?.seasons || warmthToSeasons(meta?.warmth),
+    occasions: meta?.occasions || ["casual"],
+    formality: null,
+    box_2d: meta?.box_2d || null,
+    notes: null,
+    is_digitized: true,
+    image_url_original: meta?.image_url_original ?? null,
+  });
 
   const pickImages = async () => {
     setLibraryBanner(null);
@@ -1915,20 +1904,23 @@ export default function AddScreen() {
     setBatchAnalyze({ current: 0, total: res.assets.length });
     setImage(res.assets[0].uri);
 
-    // Defer the heavy transcoding to fully yield the thread so the UI can flush the loading view
+    // Defer the heavy transcoding to fully yield the thread so the UI can flush the loading view.
+    // 50ms is plenty — one frame + buffer — vs 400ms which was producing a visible lag.
     setTimeout(async () => {
-      const jpegUris: string[] = [];
-      for (const a of res.assets) {
-        try {
-          jpegUris.push(await ensureJpegUri(a.uri));
-        } catch (e) {
-          console.warn("[upload] JPEG transcode failed, using picker URI", e);
-          jpegUris.push(a.uri);
-        }
-      }
+      // Transcode in parallel — HEIC→JPEG is independent per asset and previously serial.
+      const jpegUris = await Promise.all(
+        res.assets.map(async (a) => {
+          try {
+            return await ensureJpegUri(a.uri);
+          } catch (e) {
+            console.warn("[upload] JPEG transcode failed, using picker URI", e);
+            return a.uri;
+          }
+        }),
+      );
 
       await analyzeAllLibraryPhotos(jpegUris);
-    }, 400);
+    }, 50);
   };
 
   /** Pick photos from library and APPEND results to existing review list */
@@ -2131,34 +2123,44 @@ export default function AddScreen() {
     }
     setUploading(true);
     try {
-      // Pre-upload original images for enhanced items so we have a stable URL
-      const origUrlMap = new Map<string, string>();
-      for (const raw of aiMetaList) {
-        const origUri = raw.originalSourceUri;
-        if (!origUri || origUrlMap.has(origUri)) continue;
-        try {
-          const resp = await fetch(origUri);
-          const blob = await resp.blob();
-          const buf = await new Promise<ArrayBuffer>((res, rej) => {
-            const r = new FileReader();
-            r.onload = () => res(r.result as ArrayBuffer);
-            r.onerror = rej;
-            r.readAsArrayBuffer(blob);
-          });
-          const fn = `orig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`;
-          const { error: e } = await supabase.storage
-            .from("clothing-images")
-            .upload(fn, buf, { contentType: "image/jpeg", upsert: true });
-          if (!e) {
+      // Pre-upload original images for enhanced items so we have a stable URL.
+      // Runs in parallel — each original is an independent upload, so serial
+      // `for…await` was adding N roundtrips of latency for no reason.
+      const uniqueOrigUris = Array.from(
+        new Set(
+          aiMetaList
+            .map((r) => r.originalSourceUri)
+            .filter((u): u is string => !!u),
+        ),
+      );
+      const origUrlPairs = await Promise.all(
+        uniqueOrigUris.map(async (origUri) => {
+          try {
+            const resp = await fetch(origUri);
+            const blob = await resp.blob();
+            const buf = await new Promise<ArrayBuffer>((res, rej) => {
+              const r = new FileReader();
+              r.onload = () => res(r.result as ArrayBuffer);
+              r.onerror = rej;
+              r.readAsArrayBuffer(blob);
+            });
+            const fn = `orig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`;
+            const { error: e } = await supabase.storage
+              .from("clothing-images")
+              .upload(fn, buf, { contentType: "image/jpeg", upsert: true });
+            if (e) return null;
             const {
               data: { publicUrl },
             } = supabase.storage.from("clothing-images").getPublicUrl(fn);
-            origUrlMap.set(origUri, publicUrl);
+            return [origUri, publicUrl] as const;
+          } catch {
+            return null;
           }
-        } catch {
-          /* skip */
-        }
-      }
+        }),
+      );
+      const origUrlMap = new Map<string, string>(
+        origUrlPairs.filter((p): p is readonly [string, string] => p !== null),
+      );
 
       const byUri = new Map<string, any[]>();
       for (const raw of aiMetaList) {
@@ -2179,15 +2181,34 @@ export default function AddScreen() {
         Alert.alert("Save error", "Missing image data for these items.");
         return;
       }
-      // Process in chunks of 5 to avoid overwhelming storage + DB
-      const CHUNK = 5;
-      for (let i = 0; i < entries.length; i += CHUNK) {
-        await Promise.all(
-          entries
-            .slice(i, i + CHUNK)
-            .map(([uri, metas]) => persistItemsToCloset(uri, metas, userId)),
+      // Upload all per-item images in parallel (chunked at 10 to avoid storage
+      // overload), then do ONE batch DB insert for every row at the end.
+      // Previously this was N interleaved upload+insert roundtrips.
+      const UPLOAD_CONCURRENCY = 10;
+      const uriToPublicUrl = new Map<string, string>();
+      for (let i = 0; i < entries.length; i += UPLOAD_CONCURRENCY) {
+        const slice = entries.slice(i, i + UPLOAD_CONCURRENCY);
+        const urls = await Promise.all(
+          slice.map(([uri]) => uploadImageForCloset(uri)),
         );
+        slice.forEach(([uri], j) => {
+          const u = urls[j];
+          if (u) uriToPublicUrl.set(uri, u);
+        });
       }
+      const allRows = entries.flatMap(([uri, metas]) => {
+        const publicUrl = uriToPublicUrl.get(uri);
+        if (!publicUrl) return [];
+        return metas.map((m) => buildClothingItemRow(m, publicUrl, userId));
+      });
+      if (allRows.length === 0) {
+        Alert.alert("Save error", "All uploads failed.");
+        return;
+      }
+      const { error: insertError } = await supabase
+        .from("clothing_items")
+        .insert(allRows);
+      if (insertError) throw insertError;
       setStatus("done");
     } catch (err) {
       console.error("Upload Error:", err);
@@ -2580,16 +2601,18 @@ export default function AddScreen() {
       {status === "scanning" || status === "analyzing" ? (
         uploadSource === "library" ? (
           <View style={styles.libraryPassThrough}>
-            {status === "analyzing" && (
+            {(status === "analyzing" || status === "scanning") && (
               <View style={[styles.analyzingSheet, { paddingTop: insets.top }]}>
                 <View style={styles.analyzingSheetBody}>
                   <ActivityIndicator color={Colors.accent} size="large" />
                   <Text style={styles.analyzingTitle}>
-                    {batchAnalyze && batchAnalyze.total > 1
-                      ? `Analyzing ${batchAnalyze.total} photos…`
-                      : "Extracting items…"}
+                    {status === "scanning"
+                      ? "Opening photos…"
+                      : batchAnalyze && batchAnalyze.total > 1
+                        ? `Analyzing ${batchAnalyze.total} photos…`
+                        : "Extracting items…"}
                   </Text>
-                  {batchAnalyze && batchAnalyze.total > 1 ? (
+                  {status === "analyzing" && batchAnalyze && batchAnalyze.total > 1 ? (
                     <Text style={styles.analyzingSub}>
                       Detecting every item in each photo.
                     </Text>
