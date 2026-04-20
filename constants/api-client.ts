@@ -472,29 +472,28 @@ warmth: cold ONLY for coats, jackets, puffers, sweaters, hoodies, fleece, boots,
 
     const prompt = isIsolated ? isolatedPrompt : multiPrompt;
 
-    // Primary: OpenAI gpt-5-nano with reasoning_effort=minimal + detail=low.
-    // Fallback: Gemini 2.5 Flash Lite (retried once). Most of the time OpenAI
-    // wins; if the key is missing or the call fails we still have Gemini.
+    // Primary: Gemini 2.5 Flash Lite (retried once). OpenAI gpt-5-nano is kept
+    // as a fallback behind the scenes — but NOT as primary, because at
+    // `detail: "low"` it returns imprecise box_2d coordinates that wreck the
+    // per-item crop step, and `detail: "high"` erases the speed advantage.
     let json = "";
     let lastErr: unknown;
-    if (OPENAI_KEY) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 800));
+        json = await callGeminiClassifyVision(prompt, imageBase64);
+        if (json.trim()) break;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`[classify] Gemini attempt ${attempt + 1} failed:`, e);
+      }
+    }
+    if (!json.trim() && OPENAI_KEY) {
       try {
         json = await callOpenAIClassifyVision(prompt, imageBase64);
       } catch (e) {
         lastErr = e;
-        console.warn("[classify] OpenAI failed, falling back to Gemini:", e);
-      }
-    }
-    if (!json.trim()) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          if (attempt > 0) await new Promise((r) => setTimeout(r, 800));
-          json = await callGeminiClassifyVision(prompt, imageBase64);
-          if (json.trim()) break;
-        } catch (e) {
-          lastErr = e;
-          console.warn(`[classify] Gemini attempt ${attempt + 1} failed:`, e);
-        }
+        console.warn("[classify] OpenAI fallback failed too:", e);
       }
     }
     if (!json.trim()) {
