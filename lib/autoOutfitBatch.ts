@@ -1,7 +1,12 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { BuilderItem, ClosetItem } from "../components/fits/types";
-import { apiClient, isRetryableGeminiError } from "../constants/api-client";
+import {
+  apiClient,
+  isRetryableGeminiError,
+  StylistCallBudgetExhausted,
+  type StylistCallBudget,
+} from "../constants/api-client";
 import {
   isNearDuplicateOutfit,
   outfitFingerprint,
@@ -237,6 +242,13 @@ export async function generateAutoOutfitBatch(params: {
   const seen = new Set<string>();
   const keptIdArrays: string[][] = [];
 
+  // Hard request-level ceiling on Gemini text calls shared across the bulk
+  // call and every refill/retry below. Bulk normally returns all N looks in
+  // one call; the +2 headroom covers a couple of refills when dedupe shrinks
+  // the batch, without letting a single tap fan out into an unbounded number
+  // of calls. Each logical call may still transport-retry on transient 429/5xx.
+  const callBudget: StylistCallBudget = { used: 0, max: count + 2 };
+
   const acceptOutfit = (o: {
     item_ids: string[];
     title?: string;
@@ -268,6 +280,7 @@ export async function generateAutoOutfitBatch(params: {
       anchorItemIds,
       extraInstructions: baseExtraText,
       recentOutfitItemIds,
+      callBudget,
     });
     for (const o of bulk) {
       acceptOutfit(o);
@@ -287,7 +300,11 @@ export async function generateAutoOutfitBatch(params: {
   //    a short bulk answer left us under the requested count ───────────────
   let safety = 0;
   let retryStreak = 0;
-  while (outcomes.length < count && safety < count + 6) {
+  while (
+    outcomes.length < count &&
+    safety < count + 6 &&
+    callBudget.used < callBudget.max
+  ) {
     safety += 1;
     const i = outcomes.length;
     const hints = `${VARIATION_HINTS[i % VARIATION_HINTS.length]} This is variation ${i + 1}.`;
@@ -309,11 +326,15 @@ export async function generateAutoOutfitBatch(params: {
         anchorItemIds,
         extraInstructions: extra,
         recentOutfitItemIds,
+        callBudget,
       });
 
       acceptOutfit(raw);
       retryStreak = 0;
     } catch (err) {
+      // Request-level Gemini budget spent — stop refilling and return what we
+      // have rather than making another paid call.
+      if (err instanceof StylistCallBudgetExhausted) break;
       if (isRetryableGeminiError(err) && retryStreak < 3) {
         retryStreak += 1;
         safety -= 1;

@@ -701,6 +701,33 @@ function conflictsForIds(
   return picked.length ? outfitStyleConflicts(picked) : [];
 }
 
+/**
+ * Request-level cap on Gemini text-generation calls. A single batch request
+ * fans out into bulk + refill + per-attempt style/conflict retries; without a
+ * shared ceiling one "generate 5 looks" tap could make many calls. Callers
+ * that want a hard bound pass one budget object through every generateOutfits/
+ * generateOutfitBatch call in the request. `max` counts LOGICAL calls; each
+ * logical call may still transport-retry up to 3x inside callGeminiJson on
+ * transient 429/5xx (the same prompt re-sent), which is standard resilience,
+ * not extra generations. Omitting the budget preserves the old per-attempt
+ * bounding (used by the single-outfit server path, which is ≤2 calls anyway).
+ */
+export type StylistCallBudget = { used: number; max: number };
+
+export class StylistCallBudgetExhausted extends Error {
+  constructor() {
+    super("Stylist call budget exhausted");
+    this.name = "StylistCallBudgetExhausted";
+  }
+}
+
+/** Charge one logical Gemini call to the budget, or throw when it's spent. */
+function spendCallBudget(budget?: StylistCallBudget): void {
+  if (!budget) return;
+  if (budget.used >= budget.max) throw new StylistCallBudgetExhausted();
+  budget.used += 1;
+}
+
 export const apiClient = {
   /**
    * Classify clothing items from an image.
@@ -842,6 +869,8 @@ warmth: cold ONLY for coats, jackets, puffers, sweaters, hoodies, fleece, boots,
     /** Item-id arrays of the user's recent generated outfits (newest first);
      * pieces in them get down-ranked so the whole closet rotates. */
     recentOutfitItemIds?: string[][];
+    /** Shared request-level Gemini-call cap; see StylistCallBudget. */
+    callBudget?: StylistCallBudget;
   }) {
     const {
       occasion,
@@ -850,6 +879,7 @@ warmth: cold ONLY for coats, jackets, puffers, sweaters, hoodies, fleece, boots,
       anchorItemIds = [],
       extraInstructions,
       recentOutfitItemIds = [],
+      callBudget,
     } = preferences;
 
     if (!items || items.length === 0) {
@@ -901,6 +931,7 @@ Return ONLY a valid JSON object:
 No markdown, no explanation outside the JSON.`;
 
     const attempt = async (escalation = "") => {
+      spendCallBudget(callBudget);
       const json = await callGeminiJson(buildPrompt(escalation));
       const parsed = JSON.parse(json) as {
         item_ids: string[];
@@ -976,6 +1007,8 @@ No markdown, no explanation outside the JSON.`;
     /** Item-id arrays of the user's recent generated outfits (newest first);
      * pieces in them get down-ranked so the whole closet rotates. */
     recentOutfitItemIds?: string[][];
+    /** Shared request-level Gemini-call cap; see StylistCallBudget. */
+    callBudget?: StylistCallBudget;
   }): Promise<{ item_ids: string[]; title: string; reasoning: string }[]> {
     const {
       occasion,
@@ -985,6 +1018,7 @@ No markdown, no explanation outside the JSON.`;
       anchorItemIds = [],
       extraInstructions,
       recentOutfitItemIds = [],
+      callBudget,
     } = preferences;
 
     if (!items || items.length === 0) {
@@ -1052,6 +1086,7 @@ Include exactly ${N} entries in the "outfits" array. No markdown, no explanation
     const attempt = async (
       escalation = "",
     ): Promise<{ item_ids: string[]; title: string; reasoning: string }[]> => {
+      spendCallBudget(callBudget);
       const json = await callGeminiJson(buildPrompt(escalation));
       let parsed: any;
       try {

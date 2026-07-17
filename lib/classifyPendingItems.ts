@@ -1,5 +1,6 @@
 import { apiClient } from "../constants/api-client";
 import {
+  isLowConfidenceClassification,
   normalizeFormality,
   normalizePattern,
   normalizeStyleTags,
@@ -13,7 +14,10 @@ import { supabase } from "./supabase";
  * runs after payment, so we never pay the API bill for a non-paying user.
  *
  * Finds the user's pending items, classifies each isolated cutout, and writes
- * back name/category/color/occasions.
+ * back name/category/color/occasions. This flow is non-interactive (no user is
+ * watching to confirm), so a low-confidence result is NOT silently committed —
+ * the item is left pending (name = null) so it surfaces as an un-named cutout
+ * the user reviews and edits by hand, exactly as a hard classify failure does.
  */
 async function urlToBase64(url: string): Promise<string> {
   const res = await fetch(url);
@@ -56,7 +60,9 @@ export async function classifyPendingItems(
       // style_tags/pattern/formality — persist ALL of it, same as the
       // interactive add-items path, so onboarding items aren't second-class.
       const m = metadata?.[0];
-      if (m) {
+      // Missing/low confidence → leave pending for manual review instead of
+      // committing a guess nobody confirmed. Treated as if it never resolved.
+      if (m && !isLowConfidenceClassification(m)) {
         const styleTags = normalizeStyleTags(m.style_tags);
         await supabase
           .from("clothing_items")
