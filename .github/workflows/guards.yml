@@ -1,0 +1,28 @@
+name: Stylist guards
+
+# The shared outfit-generation rules (lib/stylistGuards.ts) protect against
+# the classic wardrobe-AI failure modes — nonsensical pairings, weather
+# blindness, repetition, ignored user prompts, misclassified objects. This
+# keeps them from silently regressing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Guard tests
+        run: npm run test:guards
+      # TODO: add "npm run typecheck" once the full app source tree is
+      # committed — today only the stylist-guard slice is tracked, so a
+      # repo-wide typecheck would fail on imports that exist locally but
+      # aren't in git yet. Run typecheck locally before pushing meanwhile.

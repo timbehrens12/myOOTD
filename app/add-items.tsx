@@ -5,23 +5,25 @@ import {
     segmentItems,
 } from "clothing-isolator";
 import { BlurView } from "expo-blur";
-import { CameraView, useCameraPermissions } from "expo-camera";
+import { CameraView, useCameraPermissions, type FlashMode } from "expo-camera";
 import * as Haptics from "expo-haptics";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
-import { useLocalSearchParams, useRouter } from "expo-router";
-import React, {
-    useCallback,
-    useEffect,
-    useMemo,
-    useRef,
-    useState,
-} from "react";
+import { LinearGradient } from "expo-linear-gradient";
+import { useLocalSearchParams, usePathname, useRouter } from "expo-router";
+import {
+  Camera,
+  Images,
+  ShieldCheck,
+  Shirt,
+  X,
+} from "lucide-react-native";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
     ActivityIndicator,
     Alert,
+    AppState,
     DeviceEventEmitter,
-    Dimensions,
     Image,
     Linking,
     Modal,
@@ -32,6 +34,7 @@ import {
     TextInput,
     TouchableOpacity,
     View,
+    useWindowDimensions,
     type StyleProp,
     type ViewStyle,
 } from "react-native";
@@ -39,37 +42,118 @@ import {
     Gesture,
     GestureDetector,
     GestureHandlerRootView,
-    ScrollView as GHScrollView,
     TouchableOpacity as GHTouchableOpacity,
 } from "react-native-gesture-handler";
 import Animated, {
+    Easing,
     FadeIn,
+    interpolate,
     runOnJS,
     useAnimatedStyle,
     useSharedValue,
+    withRepeat,
     withTiming,
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Svg, { Circle, Path, Rect } from "react-native-svg";
+import ManualCropModal from "../components/add-items/ManualCropModal";
+import OutfitUploadReview from "../components/add-items/OutfitUploadReview";
 import { shelfIdForCategoryChip } from "../components/closet/closetShelfUtils";
 import ColorPickerTriggerIcon from "../components/color-picker/ColorPickerTriggerIcon";
 import IosStyleColorPickerModal from "../components/color-picker/IosStyleColorPickerModal";
-import ZoomedItemThumb from "../components/ZoomedItemThumb";
-import { apiClient } from "../constants/api-client";
+import {
+  apiClient,
+  isLowConfidenceClassification,
+  normalizeFormality,
+  normalizePattern,
+  normalizeStyleTags,
+  primaryStyleFromTags,
+} from "../constants/api-client";
 import { APP_ITEM_NAMED_COLORS } from "../constants/appNamedColors";
-import { Colors, Styles } from "../constants/AppTheme";
+import {
+  Colors,
+  Editorial,
+  EditorialStyles,
+  Fonts,
+  Radii,
+} from "../constants/AppTheme";
 import { OCCASIONS_FLAT } from "../constants/occasions";
+import { confirmLowConfidenceItems } from "../lib/confirmLowConfidence";
 import { ensureJpegUri } from "../lib/ensureJpegForVision";
 import {
-  isShoeMeta,
-  mergePairShoeMetasInBatch,
-  mergeShoeIsolatesForSegmentBatch,
-  mergeShoePairBoxesBeforeCrop,
+    isShoeMeta,
+    mergePairShoeMetasInBatch,
+    mergeShoeIsolatesForSegmentBatch,
+    mergeShoePairBoxesBeforeCrop,
 } from "../lib/mergeShoeScanDuplicates";
+import { downloadImageToCache } from "../lib/downloadImageToCache";
+import { attachClothingItemsToOutfit } from "../lib/linkItemsToOutfit";
+import { fitsLibraryRoute } from "../lib/fitsNavigation";
 import { supabase } from "../lib/supabase";
+import { markPendingFirstWardrobePrompt } from "../lib/wardrobeOnboarding";
+import { takeAddItemsWardrobeId } from "../lib/wardrobeAddIntent";
+import { addItemsToWardrobe, fetchWardrobes } from "../lib/wardrobes/wardrobeApi";
 import { consumeLibraryIntent } from "../lib/uploadIntent";
+import {
+  ensureRecoveryDeclinesLoaded,
+  isItemsRecoveryDismissed,
+  isOutfitUploadRecoveryDismissed,
+  suppressRecoveryPrompt,
+} from "../lib/uploadRecoveryCoordinator";
+import {
+  clearOutfitUploadRecoverySession,
+  loadOutfitUploadRecoverySession,
+  migrateOutfitUploadRecoverySession,
+  persistOutfitUploadSession,
+  validateOutfitUploadRecoverySession,
+  type OutfitUploadRecoverySession,
+} from "../lib/outfitUploadRecoverySession";
+import { buildOutfitHeroFromUri } from "../lib/outfitUploadPrepare";
+import {
+  newOutfitDraftId,
+  saveOutfitUploadDraft,
+  saveOutfitUploadDrafts,
+  type OutfitUploadDraft,
+} from "../lib/outfitUploadDraft";
+import { saveUploadSessionToCloset } from "../lib/uploadRecoveryQueue";
+import { enhanceViaGeminiAndVision } from "../lib/isolateEnhanceCutout";
+import ReviewItemThumbView from "../components/review/ReviewItemThumb";
+import {
+  isItemClassifying,
+  useReviewItemReveal,
+} from "../components/review/reviewScanItemState";
+import {
+    clearUploadRecoverySession,
+    effectiveUploadUserId,
+    loadUploadRecoverySession,
+    migrateUploadRecoverySession,
+    persistUploadReviewSession,
+    sessionPendingCount,
+    sessionToAiMetaList,
+    UPLOAD_RECOVERY_LOCAL_USER,
+    validateUploadRecoverySession,
+    type UploadRecoverySession,
+} from "../lib/uploadRecoverySession";
+import { requestLibraryAccessWithPriming } from "../lib/requestLibraryAccess";
 
-const { width, height: windowHeight } = Dimensions.get("window");
+/** Temporary visual-QA lock. Turn off after the camera permission screen is approved. */
+const DEV_LOCK_CAMERA_PERMISSION_SCREEN = false; // visual QA: force the redesigned gate
+
+function isoDayIsStrictlyFuture(isoDay: string): boolean {
+  const parts = isoDay.split("-").map((n) => parseInt(n, 10));
+  const y = parts[0];
+  const mo = parts[1];
+  const d = parts[2];
+  if (y === undefined || mo === undefined || d === undefined) return false;
+  const pick = new Date(y, mo - 1, d).getTime();
+  const now = new Date();
+  const todayStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
+  return pick > todayStart;
+}
 
 /**
  * Smooth Reanimated crossfade between two image URIs on a white background.
@@ -95,13 +179,21 @@ function CrossfadeThumbImage({
   const [curUri, setCurUri] = useState<string>(uri);
   // Seed with 4:5 portrait (typical garment) so card has a sensible height
   // before Image.getSize resolves — prevents a zero-height flash on mount.
-  const [aspect, setAspect] = useState<number | undefined>(selfAspect ? 0.8 : undefined);
+  const [aspect, setAspect] = useState<number | undefined>(
+    selfAspect ? 0.8 : undefined,
+  );
   const topOpacity = useSharedValue(1);
 
   useEffect(() => {
     if (uri === curUri) return;
-    setPrevUri(curUri);
+    const nextIsPng = uri.includes("image/png");
     setCurUri(uri);
+    if (nextIsPng) {
+      setPrevUri(null);
+      topOpacity.value = 1;
+      return;
+    }
+    setPrevUri(curUri);
     topOpacity.value = 0;
     topOpacity.value = withTiming(1, { duration: 320 });
     // Drop the previous image from the tree shortly after the crossfade ends.
@@ -120,9 +212,13 @@ function CrossfadeThumbImage({
         const raw = w / h;
         setAspect(Math.max(0.55, Math.min(1.4, raw)));
       },
-      () => { /* ignore */ },
+      () => {
+        /* ignore */
+      },
     );
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [curUri, selfAspect]);
 
   const topStyle = useAnimatedStyle(() => ({ opacity: topOpacity.value }));
@@ -134,7 +230,7 @@ function CrossfadeThumbImage({
         selfAspect && aspect
           ? { aspectRatio: aspect, height: undefined }
           : null,
-        { overflow: "hidden", backgroundColor: "#fff" },
+        { overflow: "hidden", backgroundColor: Colors.homeHeroBackdrop },
       ]}
     >
       {prevUri ? (
@@ -153,13 +249,356 @@ function CrossfadeThumbImage({
   );
 }
 
+const SHIMMER_SWEEP = [
+  "transparent",
+  "rgba(255,255,255,0.55)",
+  "transparent",
+] as const;
+
+function ShimmerPlaceholderBar({
+  width = "80%",
+  height = 14,
+  style,
+}: {
+  width?: number | `${number}%`;
+  height?: number;
+  style?: StyleProp<ViewStyle>;
+}) {
+  const shimmerX = useSharedValue(-88);
+  const pulse = useSharedValue(0.55);
+
+  useEffect(() => {
+    shimmerX.value = withRepeat(
+      withTiming(168, { duration: 1300, easing: Easing.linear }),
+      -1,
+      false,
+    );
+    pulse.value = withRepeat(
+      withTiming(1, { duration: 850, easing: Easing.inOut(Easing.quad) }),
+      -1,
+      true,
+    );
+  }, [pulse, shimmerX]);
+
+  const barPulse = useAnimatedStyle(() => ({
+    opacity: interpolate(pulse.value, [0.55, 1], [0.62, 1]),
+  }));
+  const sweepStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: shimmerX.value }],
+  }));
+
+  return (
+    <Animated.View
+      style={[
+        {
+          height,
+          width,
+          borderRadius: height / 2,
+          backgroundColor: Colors.surfaceInset,
+          overflow: "hidden",
+        },
+        barPulse,
+        style,
+      ]}
+    >
+      <Animated.View
+        style={[
+          { position: "absolute", top: 0, bottom: 0, width: 72 },
+          sweepStyle,
+        ]}
+      >
+        <LinearGradient
+          colors={SHIMMER_SWEEP}
+          start={{ x: 0, y: 0.5 }}
+          end={{ x: 1, y: 0.5 }}
+          style={{ flex: 1 }}
+        />
+      </Animated.View>
+    </Animated.View>
+  );
+}
+
+const REVIEW_ITEM_META_MIN_HEIGHT = 128;
+
+function ClassifyingMetaSkeleton() {
+  return (
+    <View style={styles.classifyingMeta}>
+      <Text style={styles.classifyingLabel}>Identifying piece…</Text>
+      <ShimmerPlaceholderBar />
+      <ShimmerPlaceholderBar width="55%" style={{ marginTop: 10 }} />
+      <ShimmerPlaceholderBar width="70%" style={{ marginTop: 10 }} />
+    </View>
+  );
+}
+
+/** Review-row thumb: shimmer until the final cutout is ready. */
+function ReviewItemThumb({
+  readyUri,
+  enhancing,
+  onReady,
+}: {
+  readyUri: string | null;
+  enhancing?: boolean;
+  onReady?: () => void;
+}) {
+  return (
+    <ReviewItemThumbView
+      readyUri={readyUri}
+      enhancing={enhancing}
+      onReady={onReady}
+      thumbStyle={styles.snapItemThumb}
+      innerStyle={styles.snapItemThumbInner}
+      skeletonStyle={styles.scanSkeletonBlock}
+    />
+  );
+}
+
+function ReviewScanSkeletonActionsBar() {
+  return (
+    <View style={styles.snapItemActionsBar} pointerEvents="none">
+      <View
+        style={[styles.snapItemActionsRow, styles.snapItemActionsRowPending]}
+      >
+        <View style={styles.snapEnhanceBtn}>
+          <Text style={styles.snapEnhanceBtnText}>Enhance</Text>
+        </View>
+        <View style={styles.snapAdjustBtn}>
+          <Text style={styles.snapAdjustBtnText}>Adjust</Text>
+        </View>
+        <View style={styles.snapConfigureBtn}>
+          <Text style={styles.snapConfigureBtnText}>Configure</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function ReviewScanSkeletonCard() {
+  return (
+    <View style={styles.snapItemCard}>
+      <View style={styles.snapItemMainPressable}>
+        <View
+          style={[
+            styles.snapItemThumb,
+            styles.scanSkeletonBlock,
+            { overflow: "hidden" },
+          ]}
+        >
+          <ShimmerPlaceholderBar
+            width={138}
+            height={160}
+            style={{ borderRadius: 0 }}
+          />
+        </View>
+        <View style={styles.snapItemMeta}>
+          <ClassifyingMetaSkeleton />
+        </View>
+      </View>
+      <ReviewScanSkeletonActionsBar />
+    </View>
+  );
+}
+
+type ReviewScanItemRowProps = {
+  item: Record<string, unknown>;
+  idx: number;
+  onRemoveAt: (idx: number) => void;
+  onConfigureAt: (idx: number) => void;
+  onEnhanceAt: (idx: number) => void;
+  onAdjustAt: (idx: number) => void;
+};
+
+function ReviewScanItemRow({
+  item,
+  idx,
+  onRemoveAt,
+  onConfigureAt,
+  onEnhanceAt,
+  onAdjustAt,
+}: ReviewScanItemRowProps) {
+  const { readyUri, showMetaSkeleton, onThumbReady } =
+    useReviewItemReveal(item);
+  const pending = isItemClassifying(item) || showMetaSkeleton;
+
+  return (
+    <View style={styles.snapItemCard}>
+      <TouchableOpacity
+        activeOpacity={0.88}
+        style={styles.snapItemMainPressable}
+        onPress={() =>
+          !pending && !item._enhancing && onConfigureAt(idx)
+        }
+      >
+        <ReviewItemThumb
+          readyUri={readyUri}
+          enhancing={!!item._enhancing}
+          onReady={onThumbReady}
+        />
+        <View style={styles.snapItemMeta}>
+          {!showMetaSkeleton ? (
+            <TouchableOpacity
+              style={styles.snapItemTrashBtn}
+              onPress={() => onRemoveAt(idx)}
+              hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}
+            >
+              <IconTrashSmall />
+            </TouchableOpacity>
+          ) : null}
+          {showMetaSkeleton ? (
+            <ClassifyingMetaSkeleton />
+          ) : (
+            <View style={styles.snapItemMetaBody}>
+              <Text style={styles.snapItemName}>
+                {americanizeFashionText(
+                  String(item?.name || "Unknown item"),
+                )}
+              </Text>
+              <View style={styles.snapItemCatPill}>
+                <Text style={styles.snapItemCatText}>
+                  {americanizeFashionText(
+                    String(
+                      item?.sub_category ||
+                        item?.type ||
+                        item?.category ||
+                        "Piece",
+                    ),
+                  ).toUpperCase()}
+                </Text>
+              </View>
+              {item?.color ? (
+                <View style={styles.snapItemColorRow}>
+                  <View
+                    style={[
+                      styles.snapColorDot,
+                      {
+                        backgroundColor: swatchForItemColor(
+                          String(item.color),
+                        ),
+                      },
+                    ]}
+                  />
+                  <Text style={styles.snapItemColorText}>
+                    {String(item.color)}
+                  </Text>
+                </View>
+              ) : null}
+              {Array.isArray(item?.occasions) &&
+              (item.occasions as string[]).length > 0 ? (
+                <View style={styles.snapItemOccRow}>
+                  {(item.occasions as string[]).slice(0, 4).map((occ) => (
+                    <View key={occ} style={styles.snapItemOccChip}>
+                      <Text style={styles.snapItemOccChipText}>{occ}</Text>
+                    </View>
+                  ))}
+                </View>
+              ) : null}
+              {item?.warmth ? (
+                <Text style={styles.snapItemSeasonLine}>
+                  {item.warmth === "warm"
+                    ? "☀️ Warm weather"
+                    : item.warmth === "cold"
+                      ? "❄️ Cold weather"
+                      : "🌤 All weather"}
+                </Text>
+              ) : null}
+              {isLowConfidenceClassification(item) ? (
+                <View style={styles.snapItemLowConfidenceChip}>
+                  <Text style={styles.snapItemLowConfidenceText}>
+                    ⚠︎ Double-check this one — tap to edit
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          )}
+        </View>
+      </TouchableOpacity>
+      <View style={styles.snapItemActionsBar} pointerEvents={pending ? "none" : "auto"}>
+        <View
+          style={[
+            styles.snapItemActionsRow,
+            pending && styles.snapItemActionsRowPending,
+          ]}
+        >
+          <TouchableOpacity
+            style={[
+              styles.snapEnhanceBtn,
+              !!item._enhancing && styles.snapEnhanceBtnDisabled,
+            ]}
+            onPress={() => onEnhanceAt(idx)}
+            disabled={!!item._enhancing || pending}
+            activeOpacity={0.88}
+          >
+            <Text style={styles.snapEnhanceBtnText}>Enhance</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.snapAdjustBtn}
+            onPress={() => onAdjustAt(idx)}
+            disabled={pending}
+            activeOpacity={0.88}
+          >
+            <Text style={styles.snapAdjustBtnText}>Adjust</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.snapConfigureBtn}
+            onPress={() => onConfigureAt(idx)}
+            disabled={pending}
+          >
+            <Text style={styles.snapConfigureBtnText}>Configure</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function boxArea2d(box: number[]): number {
+  const [ymin, xmin, ymax, xmax] = box;
+  return Math.max(0, ymax - ymin) * Math.max(0, xmax - xmin);
+}
+
+function boxIoU2d(a: number[], b: number[]): number {
+  const [ay0, ax0, ay1, ax1] = a;
+  const [by0, bx0, by1, bx1] = b;
+  const iy0 = Math.max(ay0, by0);
+  const ix0 = Math.max(ax0, bx0);
+  const iy1 = Math.min(ay1, by1);
+  const ix1 = Math.min(ax1, bx1);
+  const inter = Math.max(0, iy1 - iy0) * Math.max(0, ix1 - ix0);
+  const union = boxArea2d(a) + boxArea2d(b) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+/** Drop duplicate/overlapping Gemini boxes before we mount placeholder rows. */
+function dedupeOverlappingBoxMetas(metas: any[]): any[] {
+  const withBoxes = metas.filter(
+    (m) => Array.isArray(m?.box_2d) && m.box_2d.length >= 4,
+  );
+  const withoutBoxes = metas.filter(
+    (m) => !Array.isArray(m?.box_2d) || m.box_2d.length < 4,
+  );
+  const sorted = [...withBoxes].sort(
+    (a, b) => boxArea2d(b.box_2d) - boxArea2d(a.box_2d),
+  );
+  const kept: any[] = [];
+  for (const meta of sorted) {
+    const box = meta.box_2d as number[];
+    if (kept.some((k) => boxIoU2d(box, k.box_2d as number[]) >= 0.42)) {
+      continue;
+    }
+    kept.push(meta);
+  }
+  return [...kept, ...withoutBoxes];
+}
+
 /** Minimum box span in 0–1000 space so crops are never hairlines (models love mirror edges). */
 const MIN_BOX_2D_SPAN = 115;
 const MIN_BOX_2D_SPAN_ACCESSORY = 40;
 /** Fit-check: lower = allow tighter crops (more “zoom”) on jewelry / small items. */
 const MIN_BOX_2D_SPAN_ACCESSORY_FITCHECK = 118;
-/** Necklaces / chains on fit-check: allow very tight boxes (more zoom than other accessories). */
-const MIN_BOX_2D_SPAN_NECKLACE_FITCHECK = 92;
+/** Necklaces / chains on fit-check: keep them visible without over-zooming to one corner. */
+const MIN_BOX_2D_SPAN_NECKLACE_FITCHECK = 120;
+/** Headbands / glasses on fit-check need more context than hats to stay centered. */
+const MIN_BOX_2D_SPAN_HEAD_ACCESSORY_FITCHECK = 150;
 /** Fit-check shoes: min span; pair merge + foot clamp handle width — keep this moderate. */
 const MIN_BOX_2D_SPAN_SHOE_FITCHECK = 218;
 /** Fit-check pants/bottoms/skirts: higher = less “zoomed in” on legs only. */
@@ -173,16 +612,17 @@ const MIN_BOX_2D_SPAN_FULL_BODY_FITCHECK = 208;
 const MIN_BOX_2D_SPAN_FULL_BODY_FLATLAY = 192;
 
 function isTinyAccessoryLike(meta: any): boolean {
+  if (isHeadAccessoryLike(meta)) return false;
   const text =
     `${meta?.category ?? ""} ${meta?.sub_category ?? ""} ${meta?.name ?? ""}`
       .toLowerCase()
       .trim();
   if (!text) return false;
   return (
-    /\baccessory\b/.test(text) ||
     /\b(jewelry|jewellery|earring|ring|bracelet|watch|brooch|pendant|chain|choker)\b/.test(
       text,
-    )
+    ) ||
+    (classifyCategoryLower(meta) === "accessory" && !isNeckJewelryLike(meta))
   );
 }
 
@@ -215,6 +655,97 @@ function isNeckJewelryLike(meta: any): boolean {
       .toLowerCase()
       .trim();
   return isNeckJewelryText(text);
+}
+
+function fashionText(meta: any): string {
+  return `${meta?.category ?? ""} ${meta?.sub_category ?? ""} ${meta?.type ?? ""} ${meta?.name ?? ""}`
+    .toLowerCase()
+    .trim();
+}
+
+function isHatAccessoryLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(hat|cap|beanie|beret|visor|snapback|fedora|bucket\s*hat|baseball\s*cap)\b/.test(
+    text,
+  );
+}
+
+function isEyewearAccessoryLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(glasses|sunglasses|eyewear|spectacles|goggles|shades|sunnies|aviators?|wayfarers?)\b/.test(
+    text,
+  );
+}
+
+function isHeadbandAccessoryLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(headband|hairband|bandana|durag|balaclava)\b/.test(text);
+}
+
+function isHeadAccessoryLike(meta: any): boolean {
+  return (
+    isHatAccessoryLike(meta) ||
+    isEyewearAccessoryLike(meta) ||
+    isHeadbandAccessoryLike(meta)
+  );
+}
+
+function isWristAccessoryLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(watch|watches|bracelet|bracelets|cuff|bangle)\b/.test(text);
+}
+
+function isBeltAccessoryLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(belt|waist\s*chain)\b/.test(text);
+}
+
+function isTinyWornAccessoryLike(meta: any): boolean {
+  return (
+    isEyewearAccessoryLike(meta) ||
+    isNeckJewelryLike(meta) ||
+    isWristAccessoryLike(meta) ||
+    isBeltAccessoryLike(meta)
+  );
+}
+
+function isBootLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(boot|chelsea|combat\s*boot|cowboy\s*boot|ankle\s*boot|knee[-\s]*high|thigh[-\s]*high)\b/.test(
+    text,
+  );
+}
+
+function isShortBottomLike(meta: any): boolean {
+  const text = fashionText(meta);
+  return /\b(shorts?|mini\s*skirt|skort|tennis\s*skirt|micro\s*skirt)\b/.test(
+    text,
+  );
+}
+
+function americanizeFashionText(input: string): string {
+  return input
+    .replace(/\bthongs\b/gi, "flip-flops")
+    .replace(/\bthong\b/gi, "flip-flop")
+    .replace(/\btrainers\b/gi, "sneakers")
+    .replace(/\btrainer\b/gi, "sneaker");
+}
+
+function normalizedSeasonsForMeta(meta: any): string[] | null {
+  const text = fashionText(meta);
+  const raw = Array.isArray(meta?.seasons)
+    ? (meta.seasons as unknown[])
+        .map((s) => String(s).toLowerCase().trim())
+        .filter(Boolean)
+    : [];
+  const isVeryWarmTop =
+    /\b(tube\s*top|strapless|cami|camisole|tank|crop\s*top|halter|bralette)\b/.test(
+      text,
+    );
+  if (!isVeryWarmTop) return raw.length ? raw : null;
+  const cleaned = raw.filter((s) => s !== "winter" && s !== "fall");
+  const ensured = Array.from(new Set([...cleaned, "spring", "summer"]));
+  return ensured.length ? ensured : ["spring", "summer"];
 }
 
 /**
@@ -264,18 +795,29 @@ function expandBoxForTopGarmentCrop(
   if (xmax <= xmin || ymax <= ymin) return box;
   const h = ymax - ymin;
   const w = xmax - xmin;
-  // fit_check: modest expansion only — per-box Vision segmentation (Swift) finds
-  // true garment edges precisely, so we only need a small context border.
-  // Old 22% side + hard y-clamps were hacks for the full-body mask slicing approach.
-  const up   = mode === "fit_check" ? 0.02 : 0.06;
-  const down = mode === "fit_check" ? 0.02 : 0.05;
-  const side = mode === "fit_check" ? 0.25 : 0.22; // 25% side pad gives Vision context to drop background
+  // Tops need horizontal room for sleeves and a touch of vertical room for
+  // collar/hem, but never so much that pants leak in from below.
+  const up = mode === "fit_check" ? 0.025 : 0.06;
+  // Small down-padding so the native crop keeps hems; display code also guards
+  // in-view, but a slightly generous box helps shirts/pants.
+  const down = mode === "fit_check" ? 0.025 : 0.05;
+  // Moderate side margin: enough to keep sleeves in frame without zooming so
+  // far out that adjacent garments leak in.
+  const side = mode === "fit_check" ? 0.2 : 0.22;
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
   xmax = Math.min(1000, xmax + Math.round(w * side));
-  const expanded = [ymin, xmin, ymax, xmax];
-  return mode === "fit_check" ? expanded : ensureTopGarmentMinimumWidth(expanded);
+  if (mode === "fit_check") {
+    // Mirror/OOTD top boxes often include the face. For shirt-like items, trim
+    // obvious headroom while keeping enough neck/shoulder context to identify
+    // collars and straps.
+    const maxHeadroom = Math.round(ymax - (ymax - ymin) * 0.84);
+    if (ymin < 260 && ymax > 360) {
+      ymin = Math.max(ymin, Math.min(320, maxHeadroom));
+    }
+  }
+  return ensureTopGarmentMinimumWidth([ymin, xmin, ymax, xmax]);
 }
 
 /**
@@ -284,20 +826,33 @@ function expandBoxForTopGarmentCrop(
 function expandBoxForBottomsGarmentCrop(
   box: number[],
   mode: "fit_check" | "flat_lay",
+  meta?: any,
 ): number[] {
   let [ymin, xmin, ymax, xmax] = box;
   if (xmax <= xmin || ymax <= ymin) return box;
   const h = ymax - ymin;
   const w = xmax - xmin;
-  // fit_check: reduced expansion — per-box Vision finds the pant boundaries precisely.
-  const up   = mode === "fit_check" ? 0.04 : 0.06;
-  const down = mode === "fit_check" ? 0.04 : 0.06;
-  const side = mode === "fit_check" ? 0.25 : 0.05; // Critical for removing bg between legs
+  // Small upward pad so the waistband isn't sliced when the model's top edge
+  // sits exactly on the belt-line.
+  const up = mode === "fit_check" ? 0.02 : 0.04;
+  const down = mode === "fit_check" ? 0.045 : 0.06;
+  // Moderate horizontal pad: prevents one-leg clipping without grabbing extra
+  // floor or shoes.
+  const side = mode === "fit_check" ? 0.13 : 0.06;
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
   xmax = Math.min(1000, xmax + Math.round(w * side));
   if (mode === "fit_check") {
+    if (meta && isShortBottomLike(meta)) {
+      // Shorts/mini skirts should never include calves/shoes. If the detector
+      // gives a full-leg box, keep the top and cap the lower edge around the
+      // upper-thigh region of that detected span.
+      const maxShortH = 285;
+      if (ymax - ymin > maxShortH) {
+        ymax = Math.min(1000, ymin + maxShortH);
+      }
+    }
     // Only prevent crops that reach the very floor (shoes bleeding in).
     // Removed the waist clamp (ymin<392) — it forced the box down into a fixed
     // body position that broke seated shots and close-framed photos.
@@ -324,9 +879,9 @@ function expandBoxForFullBodyGarmentCrop(
   if (xmax <= xmin || ymax <= ymin) return box;
   const h = ymax - ymin;
   const w = xmax - xmin;
-  const up = mode === "fit_check" ? 0.04 : 0.06;
-  const down = mode === "fit_check" ? 0.04 : 0.06;
-  const side = mode === "fit_check" ? 0.20 : 0.05;
+  const up = mode === "fit_check" ? 0.035 : 0.06;
+  const down = mode === "fit_check" ? 0.035 : 0.06;
+  const side = mode === "fit_check" ? 0.12 : 0.05;
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
@@ -365,13 +920,35 @@ function guessMimeFromImageUri(uri: string): {
  * KEEPS: necklaces (visible chains), watches, sunglasses, hats, belts, scarves, ties, bags.
  * SKIPS: socks, earrings, rings, bracelets/anklets, hair ties, scrunchies, hair clips, small pendants.
  */
+/**
+ * Items that should be skipped on FIT-CHECK photos (worn outfits) — too small or
+ * low-value for auto-building fits to crop well from a distance.
+ * KEEPS: Tops, Bottoms, Outerwear, Full Body, Shoes, Hats, Headbands, Bags.
+ * SKIPS: Jewelry, Watches, Glasses, Belts, Socks, Ties, Scarves, and tiny hair accessories.
+ */
 function isSkippableOnFitCheck(meta: any): boolean {
-  const text =
-    `${meta?.category ?? ""} ${meta?.sub_category ?? ""} ${meta?.name ?? ""}`
-      .toLowerCase()
-      .trim();
+  const text = fashionText(meta);
   if (!text) return false;
-  return /\b(socks?|earrings?|ring|rings|bracelets?|anklets?|hair\s*tie|scrunchies?|hair\s*clip|hairband|headband|bobby\s*pin|barrette|small\s*pendant)\b/.test(
+
+  // Skip Jewelry & Watches
+  if (isNeckJewelryLike(meta) || isWristAccessoryLike(meta)) return true;
+  if (
+    /\b(earrings?|ring|rings|brooch|pendant|small\s*pendant|jewelry|jewellery)\b/.test(
+      text,
+    )
+  )
+    return true;
+
+  // Skip Glasses/Eyewear (user said scrap for outfit scans)
+  if (isEyewearAccessoryLike(meta)) return true;
+
+  // Skip Belts, Socks, Ties, Scarves, etc.
+  if (isBeltAccessoryLike(meta)) return true;
+  if (/\b(socks?|tie|necktie|bow\s*tie|scarf|bandana|collar)\b/.test(text))
+    return true;
+
+  // Skip tiny hair accessories
+  return /\b(hair\s*tie|scrunchies?|hair\s*clip|bobby\s*pin|barrette)\b/.test(
     text,
   );
 }
@@ -381,33 +958,98 @@ function isSkippableOnFitCheck(meta: any): boolean {
  * mapped to the torso). Override the box based on where the item *must* be on a human body.
  * Returns [ymin, xmin, ymax, xmax] in 0–1000 coords, or null to use Gemini's box.
  */
-function fitCheckBoxAccessoryOverride(meta: any): number[] | null {
-  const tags = Array.isArray(meta?.style_tags) ? (meta.style_tags as unknown[]).join(" ") : "";
-  const text = `${meta?.category ?? ""} ${meta?.sub_category ?? ""} ${meta?.type ?? ""} ${meta?.name ?? ""} ${meta?.color ?? ""} ${tags}`.toLowerCase().trim();
-  
-  const hasHeadwear = /\b(hat|cap|beanie|beret|visor|snapback|fedora|bucket\s*hat|baseball\s*cap)\b/.test(text);
-  const hasEyewear = /\b(glasses|sunglasses|eyewear|spectacles|goggles|shades|sunnies|aviators?|wayfarers?)\b/.test(text);
-  
-  if (hasEyewear && !hasHeadwear) return [40, 340, 240, 660];
-  if (hasHeadwear) return [0, 300, 240, 700];
-  if (isNeckJewelryText(text)) return [230, 310, 400, 690];
-  if (/\b(collar|tie|bow\s*tie|necktie|scarf|bandana)\b/.test(text)) return [180, 280, 480, 720];
-  if (/\bbelt\b/.test(text)) return [380, 300, 540, 700];
-  // Footwear is purposely excluded so its dynamic box is preserved.
-  return null;
-}
-
 function expandBoxForAccessoryCrop(
   box: number[],
   mode: "fit_check" | "flat_lay",
+  meta?: any,
 ): number[] {
   let [ymin, xmin, ymax, xmax] = box;
   if (xmax <= xmin || ymax <= ymin) return box;
+
+  const hatLike = !!meta && isHatAccessoryLike(meta);
+  const eyewearLike = !!meta && isEyewearAccessoryLike(meta);
+  const headbandLike = !!meta && isHeadbandAccessoryLike(meta);
+  const neckLike = !!meta && isNeckJewelryLike(meta);
+
+  // ── 1. Category-specific box cleanup for fit-check accessories ──────────
+  if (mode === "fit_check" && meta) {
+    const w0 = xmax - xmin;
+    const h0 = ymax - ymin;
+    const cx0 = (xmin + xmax) / 2;
+    const cy0 = (ymin + ymax) / 2;
+
+    // Hats are currently good. Keep the same side-biased trim that removes
+    // raised-hand bleed without changing hat framing behavior.
+    if (hatLike) {
+      const maxW = Math.round(h0 * 1.9);
+      if (w0 > maxW) {
+        const useLeft = cx0 > 500; // hand likely on right side
+        if (useLeft) xmax = Math.min(1000, xmin + maxW);
+        else xmin = Math.max(0, xmax - maxW);
+      }
+    }
+
+    // Glasses/headbands: prefer symmetric width clamp around center so we
+    // don't drift to one side, and clamp to an upper-body vertical band.
+    if (eyewearLike || headbandLike) {
+      const maxAspect = eyewearLike ? 3.2 : 3.4;
+      const maxW = Math.round(h0 * maxAspect);
+      if (w0 > maxW) {
+        const half = Math.round(maxW / 2);
+        xmin = Math.max(0, Math.round(cx0) - half);
+        xmax = Math.min(1000, Math.round(cx0) + half);
+      }
+      // Headbands can be higher (hairline), glasses are mid-face.
+      const maxY = headbandLike ? 280 : 340;
+      if (ymax > maxY) {
+        const keepH = Math.max(120, Math.round((ymax - ymin) * 0.92));
+        ymax = maxY;
+        ymin = Math.max(0, ymax - keepH);
+      }
+    }
+
+    // Neck jewelry: keep chain centered in a neck/chest window, not a corner.
+    if (neckLike) {
+      const targetH = Math.max(130, Math.min(260, Math.round(h0 * 0.95)));
+      const targetW = Math.max(170, Math.min(340, Math.round(targetH * 1.55)));
+      const cyClamped = Math.max(240, Math.min(cy0, 500));
+      const halfW = Math.round(targetW / 2);
+      const halfH = Math.round(targetH / 2);
+      xmin = Math.max(0, Math.round(cx0) - halfW);
+      xmax = Math.min(1000, Math.round(cx0) + halfW);
+      ymin = Math.max(0, Math.round(cyClamped) - halfH);
+      ymax = Math.min(1000, Math.round(cyClamped) + halfH);
+    }
+  }
+
   const h = ymax - ymin;
   const w = xmax - xmin;
-  const up = mode === "fit_check" ? 0.10 : 0.10;
-  const down = mode === "fit_check" ? 0.10 : 0.10;
-  const side = mode === "fit_check" ? 0.25 : 0.15;
+  // Per-accessory expansion. Keep hats untouched; relax other head accessories
+  // and chains to avoid corner crops.
+  const up =
+    mode === "fit_check"
+      ? neckLike
+        ? 0.04
+        : eyewearLike || headbandLike
+          ? 0.06
+          : 0.02
+      : 0.1;
+  const down =
+    mode === "fit_check"
+      ? neckLike
+        ? 0.06
+        : eyewearLike || headbandLike
+          ? 0.03
+          : 0.02
+      : 0.1;
+  const side =
+    mode === "fit_check"
+      ? neckLike
+        ? 0.08
+        : eyewearLike || headbandLike
+          ? 0.08
+          : 0.05
+      : 0.15;
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
@@ -418,14 +1060,17 @@ function expandBoxForAccessoryCrop(
 function expandBoxForFootwearCrop(
   box: number[],
   mode: "fit_check" | "flat_lay",
+  meta?: any,
 ): number[] {
   let [ymin, xmin, ymax, xmax] = box;
   if (xmax <= xmin || ymax <= ymin) return box;
   const h = ymax - ymin;
   const w = xmax - xmin;
-  const up = mode === "fit_check" ? 0.05 : 0.10;
-  const down = mode === "fit_check" ? 0.05 : 0.10;
-  const side = mode === "fit_check" ? 0.25 : 0.15;
+  const bootLike = !!meta && isBootLike(meta);
+  const up = mode === "fit_check" ? (bootLike ? 0.12 : 0.09) : 0.1;
+  const down = mode === "fit_check" ? (bootLike ? 0.18 : 0.12) : 0.1;
+  // Moderate horizontal pad: keeps both shoes in frame without grabbing floor.
+  const side = mode === "fit_check" ? (bootLike ? 0.16 : 0.14) : 0.15;
   ymin = Math.max(0, ymin - Math.round(h * up));
   ymax = Math.min(1000, ymax + Math.round(h * down));
   xmin = Math.max(0, xmin - Math.round(w * side));
@@ -444,6 +1089,59 @@ function isTopGarment(meta: any): boolean {
   return /\b(shirt|tee|t-?shirt|top|blouse|sweater|sweatshirt|hoodie|jacket|coat|blazer|cardigan|vest|tank|crop\s*top|polo|jersey|tunic|dress|romper|jumpsuit|bodysuit|suit|outerwear|knit|fleece|crewneck|pullover|henley)\b/.test(
     text,
   );
+}
+
+/**
+ * Re-balance a box so neither side is glued to the original tight bounds. If the
+ * supplied box has different left/right margins relative to a reference center
+ * (e.g. body center), shift outward to make both margins at least `minMarginPct`
+ * of the box width. Keeps the larger margin intact when one side hits the frame.
+ */
+function ensureSymmetricSideMargins(
+  box: number[],
+  minMarginPct = 0.06,
+): number[] {
+  let [ymin, xmin, ymax, xmax] = box;
+  if (xmax <= xmin || ymax <= ymin) return box;
+  const w = xmax - xmin;
+  const minMargin = Math.round(w * minMarginPct);
+  // We don't know the garment edge precisely; approximate by ensuring the
+  // crop has at least `minMargin` between any of its edges and the next body
+  // landmark (the frame). For body-frame purposes the helpful effect is that
+  // boxes which already touch 0 or 1000 get pushed away from that edge if
+  // there's room.
+  if (xmin < minMargin) xmin = Math.max(0, xmin - minMargin);
+  if (xmax > 1000 - minMargin) xmax = Math.min(1000, xmax + minMargin);
+  if (ymin < minMargin) ymin = Math.max(0, ymin - minMargin);
+  if (ymax > 1000 - minMargin) ymax = Math.min(1000, ymax + minMargin);
+  return [ymin, xmin, ymax, xmax];
+}
+
+/**
+ * After category-specific expansion, double the side padding on the side that
+ * is closer to the model's original box (asymmetric crop fixer). Prevents
+ * one-shoulder/leg/foot clipping when the source box was offset.
+ */
+function rebalanceCropSides(
+  expanded: number[],
+  originalBox: number[],
+  extraSidePct = 0.06,
+): number[] {
+  let [ymin, xmin, ymax, xmax] = expanded;
+  const [, oxmin, , oxmax] = originalBox;
+  if (xmax <= xmin) return expanded;
+  const w = xmax - xmin;
+  const leftMargin = oxmin - xmin;
+  const rightMargin = xmax - oxmax;
+  if (leftMargin >= 0 && rightMargin >= 0) {
+    const extra = Math.round(w * extraSidePct);
+    if (leftMargin < rightMargin) {
+      xmin = Math.max(0, xmin - extra);
+    } else if (rightMargin < leftMargin) {
+      xmax = Math.min(1000, xmax + extra);
+    }
+  }
+  return [ymin, xmin, ymax, xmax];
 }
 
 /**
@@ -498,18 +1196,494 @@ function expandDegenerateBox2d(box: number[], minSpan: number): number[] {
   ];
 }
 
+function boxCenterX(box: unknown): number | null {
+  if (!Array.isArray(box) || box.length !== 4) return null;
+  const [, xmin, , xmax] = box as number[];
+  if (xmax <= xmin) return null;
+  return (xmin + xmax) / 2;
+}
+
+type FitCheckBodyGeometry = {
+  centerX: number;
+  leftX: number;
+  rightX: number;
+  headY: number;
+  eyeY: number;
+  neckY: number;
+  chestY: number;
+  waistY: number;
+};
+
+type CropCandidate = {
+  box: number[];
+  reason: string;
+};
+
+function clampBox2d(box: number[]): number[] {
+  let [ymin, xmin, ymax, xmax] = box;
+  ymin = Math.max(0, Math.min(1000, Math.round(ymin)));
+  xmin = Math.max(0, Math.min(1000, Math.round(xmin)));
+  ymax = Math.max(0, Math.min(1000, Math.round(ymax)));
+  xmax = Math.max(0, Math.min(1000, Math.round(xmax)));
+  if (ymax <= ymin) ymax = Math.min(1000, ymin + 40);
+  if (xmax <= xmin) xmax = Math.min(1000, xmin + 40);
+  return [ymin, xmin, ymax, xmax];
+}
+
+function centeredBox2d(cx: number, cy: number, w: number, h: number): number[] {
+  return clampBox2d([cy - h / 2, cx - w / 2, cy + h / 2, cx + w / 2]);
+}
+
+function boxMetrics(box: number[]) {
+  const [ymin, xmin, ymax, xmax] = box;
+  const w = xmax - xmin;
+  const h = ymax - ymin;
+  return {
+    ymin,
+    xmin,
+    ymax,
+    xmax,
+    w,
+    h,
+    cx: (xmin + xmax) / 2,
+    cy: (ymin + ymax) / 2,
+    area: w * h,
+  };
+}
+
+function inferFitCheckBodyGeometry(items: any[]): FitCheckBodyGeometry {
+  const usable = items
+    .map((m: any) => {
+      const cx = boxCenterX(m?.box_2d);
+      if (cx == null) return null;
+      const [ymin, xmin, ymax, xmax] = m.box_2d as number[];
+      return { cx, ymin, xmin, ymax, xmax, meta: m };
+    })
+    .filter(Boolean) as {
+    cx: number;
+    ymin: number;
+    xmin: number;
+    ymax: number;
+    xmax: number;
+    meta: any;
+  }[];
+
+  const headAnchor = usable.find(
+    ({ meta }) =>
+      (isHatAccessoryLike(meta) || isHeadbandAccessoryLike(meta)) &&
+      !isEyewearAccessoryLike(meta),
+  );
+
+  const upperBodyAnchor = usable.find(
+    ({ meta, ymin, ymax }) =>
+      (isTopGarment(meta) || classifyCategoryLower(meta) === "outerwear") &&
+      ymin < 520 &&
+      ymax > 180,
+  );
+  const fullBodyAnchor = usable.find(({ meta }) => isFullBodyCategory(meta));
+  const bottomAnchor = usable.find(({ meta }) => isBottomsLike(meta));
+  const centerX =
+    headAnchor?.cx ??
+    upperBodyAnchor?.cx ??
+    fullBodyAnchor?.cx ??
+    bottomAnchor?.cx ??
+    500;
+
+  const bodyAnchors = usable.filter(
+    ({ meta }) =>
+      isTopGarment(meta) ||
+      isBottomsLike(meta) ||
+      isFullBodyCategory(meta) ||
+      classifyCategoryLower(meta) === "outerwear",
+  );
+  const leftX =
+    bodyAnchors.length > 0
+      ? Math.min(...bodyAnchors.map((b) => b.xmin))
+      : Math.max(80, centerX - 180);
+  const rightX =
+    bodyAnchors.length > 0
+      ? Math.max(...bodyAnchors.map((b) => b.xmax))
+      : Math.min(920, centerX + 180);
+  const topY =
+    headAnchor?.ymin ??
+    (upperBodyAnchor ? Math.max(0, upperBodyAnchor.ymin - 180) : 70);
+  const neckY = upperBodyAnchor
+    ? Math.max(190, Math.min(360, upperBodyAnchor.ymin + 65))
+    : Math.max(190, topY + 145);
+  const chestY = upperBodyAnchor
+    ? Math.max(
+        260,
+        Math.min(520, (upperBodyAnchor.ymin + upperBodyAnchor.ymax) / 2),
+      )
+    : neckY + 120;
+  const waistY = bottomAnchor
+    ? Math.max(420, Math.min(760, bottomAnchor.ymin + 25))
+    : upperBodyAnchor
+      ? Math.max(420, Math.min(740, upperBodyAnchor.ymax - 30))
+      : 560;
+
+  return {
+    centerX,
+    leftX,
+    rightX,
+    headY: Math.max(60, Math.min(210, topY + 60)),
+    eyeY: Math.max(95, Math.min(235, topY + 115)),
+    neckY,
+    chestY,
+    waistY,
+  };
+}
+
+type PersonBbox = {
+  ymin: number;
+  xmin: number;
+  ymax: number;
+  xmax: number;
+  w: number;
+  h: number;
+  headYmin: number;
+  /** True when at least 2 garment boxes were available, so the union is a
+   *  reasonable proxy for the person's silhouette. With only 1 item we don't
+   *  trust the union and skip body-zone framing. */
+  reliable: boolean;
+};
+
 /**
- * Resize an image (URI or data URI) to max 1024px on longest side before sending to OpenAI.
- * Returns a plain base64 string (no data: prefix).
+ * Best-effort person bbox from the union of all detected item boxes. We use
+ * this as the canvas inside which body zones (head/neck/upper/lower/feet)
+ * are computed. When the photo only has 1 detected item, we can't infer the
+ * person silhouette so this returns `reliable=false`.
  */
-async function resizeForVision(sourceUri: string): Promise<string> {
+function inferPersonBbox(items: any[]): PersonBbox | null {
+  const usable = items
+    .map((m: any) => {
+      if (!Array.isArray(m?.box_2d) || m.box_2d.length !== 4) return null;
+      const [ymin, xmin, ymax, xmax] = m.box_2d as number[];
+      if (xmax <= xmin || ymax <= ymin) return null;
+      return { ymin, xmin, ymax, xmax, meta: m };
+    })
+    .filter(Boolean) as {
+    ymin: number;
+    xmin: number;
+    ymax: number;
+    xmax: number;
+    meta: any;
+  }[];
+  if (usable.length === 0) return null;
+
+  // Prefer body anchors for the person silhouette so a stray hat/glasses box
+  // doesn't pull the union to extreme y values when not actually placed there.
+  const anchors = usable.filter(
+    ({ meta }) =>
+      isTopGarment(meta) ||
+      isBottomsLike(meta) ||
+      isFullBodyCategory(meta) ||
+      classifyCategoryLower(meta) === "outerwear" ||
+      isShoeMeta(meta),
+  );
+  const pool = anchors.length >= 2 ? anchors : usable;
+  const ymin = Math.min(...pool.map((b) => b.ymin));
+  const ymax = Math.max(...pool.map((b) => b.ymax));
+  const xmin = Math.min(...pool.map((b) => b.xmin));
+  const xmax = Math.max(...pool.map((b) => b.xmax));
+  const upper = pool.find(
+    ({ meta }) =>
+      isTopGarment(meta) || classifyCategoryLower(meta) === "outerwear",
+  );
+  const shoe = pool.find(({ meta }) => isShoeMeta(meta));
+  let height = ymax - ymin;
+  const width = xmax - xmin;
+
+  // Seated/Squatting pose detection: if the detected garments are very wide
+  // relative to height, the person is likely sitting. Standard standing
+  // height-to-width is ~2.8-3.2x. If we're below 1.8x, expand the person box
+  // downward to prevent "squashed" body zones.
+  if (height < width * 1.8) {
+    height = Math.round(width * 2.2);
+  }
+
+  // Widen the X-axis: model boxes are often too tight on sleeves/legs.
+  // Expand the silhouette width by 15% to ensure limbs aren't clipped.
+  const wExpand = Math.round(width * 0.15);
+  const wideXmin = Math.max(0, xmin - wExpand);
+  const wideXmax = Math.min(1000, xmax + wExpand);
+
+  // Garment union usually starts around collar/chest, not the top of head.
+  // Extrapolate a person-head top from the upper garment when possible.
+  const headYmin = upper
+    ? Math.max(0, Math.round(upper.ymin - height * 0.15))
+    : Math.max(0, Math.round(ymin - height * 0.1));
+  const footYmax = shoe
+    ? Math.min(1000, Math.round(shoe.ymax + height * 0.02))
+    : Math.min(1000, headYmin + height);
+
+  return {
+    ymin: headYmin,
+    xmin: wideXmin,
+    ymax: footYmax,
+    xmax: wideXmax,
+    w: wideXmax - wideXmin,
+    h: footYmax - headYmin,
+    headYmin,
+    reliable: pool.length >= 2,
+  };
+}
+
+/**
+ * Body-zone crop box for a given item. Returns a SQUARE band centered on the
+ * person's centerline for every item of a given category. This matches the
+ * visual style of top-tier fashion apps (consistent framing across photos).
+ *
+ * Returns null when no zone is appropriate.
+ */
+function bodyZoneCropBox(item: any, person: PersonBbox): number[] | null {
+  if (!person.reliable) return null;
+  const {
+    ymin: pYmin,
+    ymax: pYmax,
+    h: pH,
+    xmin: pXmin,
+    xmax: pXmax,
+    w: pW,
+  } = person;
+  const centerX = (pXmin + pXmax) / 2;
+
+  /**
+   * Returns a square box centered on the person's X-axis.
+   * @param topPct - start of the band (0 = head top, 1 = feet)
+   * @param bottomPct - end of the band
+   * @param widthMult - multiplier for the square size (default 1.0 = band height)
+   */
+  const squareZone = (topPct: number, bottomPct: number, widthMult = 1.1) => {
+    const ymin = Math.max(0, Math.round(pYmin + pH * topPct));
+    const ymax = Math.min(1000, Math.round(pYmin + pH * bottomPct));
+    const h = ymax - ymin;
+
+    // Ensure the square width is at least the full person width to prevent clipping
+    const minW = pW;
+    const w = Math.max(minW, Math.round(h * widthMult));
+    return [
+      ymin,
+      Math.max(0, Math.round(centerX - w / 2)),
+      ymax,
+      Math.min(1000, Math.round(centerX + w / 2)),
+    ];
+  };
+
+  // ─── COMP-STYLE FIXED BANDS ───────────────────────────────────────────────
+  // These percentages are tuned to match the competitor's visual language:
+  // - Upper items (Tops/Jackets) include the head for context.
+  // - Lower items (Pants) start at the waist and include the feet.
+  // - Shoes focus on the shins-to-floor area.
+
+  if (isFullBodyCategory(item)) return squareZone(0, 1.0, 0.8);
+  if (isShoeMeta(item)) return squareZone(0.7, 1.0, 1.3);
+  if (isBottomsLike(item)) {
+    return isShortBottomLike(item)
+      ? squareZone(0.4, 0.75, 1.2)
+      : squareZone(0.4, 1.0, 0.9);
+  }
+  if (classifyCategoryLower(item) === "outerwear") {
+    // Jackets: Head to mid-thigh
+    return squareZone(0, 0.65, 0.95);
+  }
+  if (isTopGarment(item)) {
+    // Tops: Head to waist
+    return squareZone(0, 0.55, 1.05);
+  }
+
+  // Head accessories (Hats/Glasses) use a tighter head-focused square
+  if (isHatAccessoryLike(item) || isHeadbandAccessoryLike(item)) {
+    return squareZone(0, 0.28, 1.3);
+  }
+  if (isEyewearAccessoryLike(item)) {
+    return squareZone(0.02, 0.26, 1.4);
+  }
+  if (isNeckJewelryLike(item)) {
+    return squareZone(0.1, 0.4, 1.3);
+  }
+  if (isBeltAccessoryLike(item)) {
+    return squareZone(0.38, 0.6, 1.5);
+  }
+
+  return null;
+}
+
+function candidateBoxesForAccessory(
+  item: any,
+  currentBox: number[],
+  body: FitCheckBodyGeometry,
+): CropCandidate[] {
+  const current = clampBox2d(currentBox);
+  const candidates: CropCandidate[] = [{ box: current, reason: "model" }];
+  const currentMetrics = boxMetrics(current);
+  const add = (box: number[], reason: string) => {
+    const clamped = clampBox2d(box);
+    if (
+      !candidates.some((c) => JSON.stringify(c.box) === JSON.stringify(clamped))
+    ) {
+      candidates.push({ box: clamped, reason });
+    }
+  };
+
+  if (isEyewearAccessoryLike(item)) {
+    add(centeredBox2d(body.centerX, body.eyeY, 300, 130), "eye-zone");
+  } else if (isNeckJewelryLike(item)) {
+    add(centeredBox2d(body.centerX, body.neckY + 70, 300, 220), "neck-zone");
+    add(centeredBox2d(body.centerX, body.chestY, 340, 240), "chest-zone");
+  } else if (isWristAccessoryLike(item)) {
+    // Wrists land anywhere from chest to upper-thigh depending on pose, so we
+    // generate multiple y-bands and let scoring pick the one closest to the
+    // model's vertical hint. Boxes are wider (220) so a tilted forearm still
+    // fits inside the frame.
+    const leftWristX = Math.max(60, body.leftX - 25);
+    const rightWristX = Math.min(940, body.rightX + 25);
+    const elbowY = Math.round((body.chestY + body.waistY) / 2);
+    const hipY = Math.round(body.waistY + 30);
+    const sideBias = currentMetrics.cx < body.centerX ? -1 : 1;
+    const sideX = sideBias < 0 ? leftWristX : rightWristX;
+    add(centeredBox2d(sideX, currentMetrics.cy, 220, 220), "wrist-near-model");
+    add(centeredBox2d(sideX, elbowY, 220, 220), "wrist-side-elbow");
+    add(centeredBox2d(sideX, hipY, 220, 220), "wrist-side-hip");
+    add(centeredBox2d(leftWristX, elbowY, 220, 220), "wrist-left-elbow");
+    add(centeredBox2d(rightWristX, elbowY, 220, 220), "wrist-right-elbow");
+    add(centeredBox2d(leftWristX, hipY, 220, 220), "wrist-left-hip");
+    add(centeredBox2d(rightWristX, hipY, 220, 220), "wrist-right-hip");
+  } else if (isBeltAccessoryLike(item)) {
+    add(centeredBox2d(body.centerX, body.waistY, 430, 150), "waist-zone");
+  }
+
+  return candidates;
+}
+
+function scoreCropCandidate(
+  item: any,
+  candidate: CropCandidate,
+  body: FitCheckBodyGeometry,
+  originalBox: number[],
+): number {
+  const b = boxMetrics(candidate.box);
+  const original = boxMetrics(originalBox);
+  let score = candidate.reason === "model" ? 4 : 0;
+  const aspect = b.w / Math.max(1, b.h);
+
+  if (isEyewearAccessoryLike(item)) {
+    score += 40 - Math.abs(b.cy - body.eyeY) * 0.45;
+    score += 22 - Math.abs(b.cx - body.centerX) * 0.08;
+    if (aspect >= 1.4 && aspect <= 3.6) score += 12;
+    if (b.cy > body.neckY) score -= 35;
+  } else if (isNeckJewelryLike(item)) {
+    score += 35 - Math.abs(b.cy - (body.neckY + 70)) * 0.14;
+    score += 18 - Math.abs(b.cx - body.centerX) * 0.06;
+    if (b.h >= 120 && b.h <= 280 && b.w <= 380) score += 10;
+  } else if (isWristAccessoryLike(item)) {
+    // Watches must sit on a wrist (left or right side of body), not on the
+    // torso. Heavily reward boxes near the body's left/right edge and any y
+    // between chest and hip; heavily penalize torso-centered boxes.
+    const leftEdgeX = Math.max(60, body.leftX - 25);
+    const rightEdgeX = Math.min(940, body.rightX + 25);
+    const nearestWristDist = Math.min(
+      Math.abs(b.cx - leftEdgeX),
+      Math.abs(b.cx - rightEdgeX),
+    );
+    score += 42 - nearestWristDist * 0.16;
+    const inWristYBand = b.cy >= body.chestY - 20 && b.cy <= body.waistY + 80;
+    score += inWristYBand ? 18 : -22;
+    if (b.w >= 140 && b.w <= 260 && b.h >= 140 && b.h <= 260) score += 14;
+    // Reward staying close to the model's vertical hint when it isn't crazy.
+    if (Math.abs(b.cy - original.cy) < 110) score += 8;
+    // Hard penalty on torso-centered boxes — the model often boxes the watch
+    // on the chest/jacket panel.
+    if (Math.abs(b.cx - body.centerX) < 110) score -= 26;
+    // Small extra penalty when the model's own box is what we're scoring
+    // and it sits on the torso, so a sane wrist candidate beats it.
+    if (candidate.reason === "model" && Math.abs(b.cx - body.centerX) < 130) {
+      score -= 18;
+    }
+  } else if (isBeltAccessoryLike(item)) {
+    score += 34 - Math.abs(b.cy - body.waistY) * 0.12;
+    score += 12 - Math.abs(b.cx - body.centerX) * 0.04;
+    if (aspect >= 2.0 && aspect <= 5.2) score += 10;
+  }
+
+  if (b.area < 7000) score -= 8;
+  if (b.area > 140000) score -= 12;
+  if (b.ymin <= 0 || b.xmin <= 0 || b.ymax >= 1000 || b.xmax >= 1000) {
+    score -= 3;
+  }
+  return score;
+}
+
+function selectBestCropBox(
+  item: any,
+  currentBox: number[],
+  body: FitCheckBodyGeometry,
+): { box: number[]; reason: string; score: number } {
+  if (!isTinyWornAccessoryLike(item)) {
+    return { box: currentBox, reason: "not-tiny-accessory", score: 0 };
+  }
+  const candidates = candidateBoxesForAccessory(item, currentBox, body);
+  const scored = candidates
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreCropCandidate(item, candidate, body, currentBox),
+    }))
+    .sort((a, b) => b.score - a.score);
+  const best = scored[0] ?? { box: currentBox, reason: "fallback", score: 0 };
+  if (__DEV__ && best.reason !== "model") {
+    console.log("[crop-select]", {
+      item: fashionText(item),
+      reason: best.reason,
+      score: Math.round(best.score),
+      original: currentBox,
+      selected: best.box,
+    });
+  }
+  return best;
+}
+
+/**
+ * If a per-item native crop came back as a JPEG (Vision didn't find a
+ * foreground for that patch and fell back to the raw color crop), re-run
+ * on-device segmentation on it to recover the transparent PNG cutout. We pick
+ * the largest segmented instance to avoid stray reflections/shadows.
+ */
+async function rescueBackgroundIfMissing(dataUri: string): Promise<string> {
+  if (!dataUri || !dataUri.startsWith("data:image/jpeg")) return dataUri;
   try {
-    // 768px + 0.75 quality is ~40% smaller payload than 1024/0.82 with no
-    // measurable classify-accuracy loss. Upload + time-to-first-byte wins add
-    // up across batches.
+    const plain = dataUri.replace(/^data:image\/[a-z0-9.+-]+;base64,/i, "");
+    if (!plain) return dataUri;
+    const segments = await segmentItems(plain);
+    if (!segments || segments.length === 0) return dataUri;
+    // Pick the largest non-empty segment as the rescue. Without dimensions
+    // available here, segments[0] is fine — the native module already returns
+    // them sorted by foreground area.
+    const best = segments[0];
+    return best && best.startsWith("data:image/") ? best : dataUri;
+  } catch (e) {
+    if (__DEV__) console.warn("[rescueBackgroundIfMissing]", e);
+    return dataUri;
+  }
+}
+
+/**
+ * Resize an image (URI or data URI) before sending to the vision model.
+ * Returns a plain base64 string (no data: prefix).
+ *
+ * Width: 768 (default) for classify-only calls — ~40% smaller payload than
+ * 1024 with no measurable label-accuracy loss. Pass 1024 for multi-item
+ * box detection: box_2d precision degrades visibly at 768 (mis-aimed crops
+ * on skirts/bags in fit-check photos), and those calls are per-photo rather
+ * than per-item so the payload cost is paid once.
+ */
+async function resizeForVision(
+  sourceUri: string,
+  width: number = 768,
+): Promise<string> {
+  try {
     const result = await ImageManipulator.manipulateAsync(
       sourceUri,
-      [{ resize: { width: 768 } }],
+      [{ resize: { width } }],
       {
         compress: 0.75,
         format: ImageManipulator.SaveFormat.JPEG,
@@ -541,7 +1715,9 @@ async function resizeForVision(sourceUri: string): Promise<string> {
 async function jsFitCheckCrop(
   originalUri: string,
   items: any[],
+  options?: { removeBackground?: boolean },
 ): Promise<any[]> {
+  const removeBackground = options?.removeBackground ?? false;
   // Resolve file dimensions + stable file URI once; reuse for every crop.
   let imgW = 0;
   let imgH = 0;
@@ -603,9 +1779,22 @@ async function jsFitCheckCrop(
             base64: true,
           },
         );
-        const sourceUri = result.base64
+        let sourceUri = result.base64
           ? `data:image/jpeg;base64,${result.base64}`
           : originalUri;
+        // Optional: run Vision on the cropped JPEG to pull the person off the
+        // background so tiny accessories (glasses, watches, chains) match the
+        // rest of the review thumbs visually.
+        if (removeBackground && result.base64) {
+          try {
+            const segments = await segmentItems(result.base64);
+            if (segments && segments.length > 0 && segments[0]) {
+              sourceUri = segments[0];
+            }
+          } catch {
+            /* keep JPEG */
+          }
+        }
         return {
           ...m,
           sourceUri,
@@ -639,45 +1828,79 @@ async function cropItemsForFitCheck(
     effectiveLayout === "fit_check"
       ? items.filter((m: any) => !isSkippableOnFitCheck(m))
       : items;
-
+  const bodyGeometry =
+    effectiveLayout === "fit_check"
+      ? inferFitCheckBodyGeometry(filtered)
+      : null;
   const prepared = filtered.map((m: any) => {
     let activeBox = m.box_2d;
     if (!Array.isArray(activeBox) || activeBox.length !== 4) return m;
 
-    if (effectiveLayout === "fit_check") {
-      const override = fitCheckBoxAccessoryOverride(m);
-      if (override) {
-        activeBox = override;
-      }
+    if (effectiveLayout === "fit_check" && bodyGeometry) {
+      // Keep Gemini's item box for garments/shoes/hats. Only tiny worn
+      // accessories get a body-aware candidate picker; broad body-zone overrides
+      // make every category crop like a generic body region instead of the item.
+      activeBox = selectBestCropBox(m, activeBox as number[], bodyGeometry).box;
     }
 
-    const minSpan = isTinyAccessoryLike(m)
-      ? MIN_BOX_2D_SPAN_ACCESSORY
-      : isFullBodyCategory(m)
-        ? MIN_BOX_2D_SPAN_FULL_BODY_FLATLAY
-        : isBottomsLike(m)
-          ? MIN_BOX_2D_SPAN_BOTTOMS_FLATLAY
-          : isTopGarment(m)
-            ? MIN_BOX_2D_SPAN_TOP_FLATLAY
-            : MIN_BOX_2D_SPAN;
-    
-    let box = expandDegenerateBox2d(activeBox as number[], minSpan);
-    
+    const minSpan =
+      effectiveLayout === "fit_check"
+        ? isShoeMeta(m)
+          ? MIN_BOX_2D_SPAN_SHOE_FITCHECK
+          : isHeadbandAccessoryLike(m) || isEyewearAccessoryLike(m)
+            ? MIN_BOX_2D_SPAN_HEAD_ACCESSORY_FITCHECK
+            : isNeckJewelryLike(m)
+              ? MIN_BOX_2D_SPAN_NECKLACE_FITCHECK
+              : isTinyAccessoryLike(m)
+                ? MIN_BOX_2D_SPAN_ACCESSORY_FITCHECK
+                : isFullBodyCategory(m)
+                  ? MIN_BOX_2D_SPAN_FULL_BODY_FITCHECK
+                  : isBottomsLike(m)
+                    ? MIN_BOX_2D_SPAN_BOTTOMS_FITCHECK
+                    : isTopGarment(m)
+                      ? MIN_BOX_2D_SPAN_TOP_FITCHECK
+                      : MIN_BOX_2D_SPAN
+        : isHeadbandAccessoryLike(m) || isEyewearAccessoryLike(m)
+          ? MIN_BOX_2D_SPAN_HEAD_ACCESSORY_FITCHECK
+          : isNeckJewelryLike(m)
+            ? MIN_BOX_2D_SPAN_NECKLACE_FITCHECK
+            : isTinyAccessoryLike(m)
+              ? MIN_BOX_2D_SPAN_ACCESSORY
+              : isFullBodyCategory(m)
+                ? MIN_BOX_2D_SPAN_FULL_BODY_FLATLAY
+                : isBottomsLike(m)
+                  ? MIN_BOX_2D_SPAN_BOTTOMS_FLATLAY
+                  : isTopGarment(m)
+                    ? MIN_BOX_2D_SPAN_TOP_FLATLAY
+                    : MIN_BOX_2D_SPAN;
+
+    const tightBox = expandDegenerateBox2d(activeBox as number[], minSpan);
+    let box = tightBox;
+
     if (isFullBodyCategory(m)) {
       box = expandBoxForFullBodyGarmentCrop(box, effectiveLayout);
     } else if (isTopGarment(m)) {
       box = expandBoxForTopGarmentCrop(box, effectiveLayout);
     } else if (isBottomsLike(m)) {
-      box = expandBoxForBottomsGarmentCrop(box, effectiveLayout);
+      box = expandBoxForBottomsGarmentCrop(box, effectiveLayout, m);
     } else if (isShoeMeta(m)) {
-      box = expandBoxForFootwearCrop(box, effectiveLayout);
+      box = expandBoxForFootwearCrop(box, effectiveLayout, m);
     } else {
-      box = expandBoxForAccessoryCrop(box, effectiveLayout);
+      box = expandBoxForAccessoryCrop(box, effectiveLayout, m);
     }
-    
+
+    if (
+      effectiveLayout === "fit_check" &&
+      (isTopGarment(m) ||
+        isBottomsLike(m) ||
+        isFullBodyCategory(m) ||
+        isShoeMeta(m))
+    ) {
+      box = rebalanceCropSides(box, tightBox, isShoeMeta(m) ? 0.05 : 0.035);
+    }
+
     return { ...m, box_2d: box };
   });
-
 
   // ── fit_check: tight box → Vision → background removed cleanly ──────────
   // The tight Gemini box (collar-to-hem for a shirt, waist-to-ankle for pants) is
@@ -686,31 +1909,59 @@ async function cropItemsForFitCheck(
   // full person, and masks exactly the shirt. Background removal works; head/pants
   // bleed is gone. jsFitCheckCrop is the fallback when Swift Vision fails.
   if (effectiveLayout === "fit_check") {
-    const boxes: number[][] = prepared
+    const directCropItems = prepared.filter((m: any) =>
+      isTinyWornAccessoryLike(m),
+    );
+    const visionItems = prepared.filter(
+      (m: any) => !isTinyWornAccessoryLike(m),
+    );
+    const boxes: number[][] = visionItems
       .map((m: any) => m.box_2d)
       .filter(Array.isArray);
+    const directCrops =
+      directCropItems.length > 0
+        ? await jsFitCheckCrop(originalUri, directCropItems, {
+            removeBackground: true,
+          })
+        : [];
     if (boxes.length > 0) {
       const origB64 = await imageUriToPlainBase64(originalUri);
       if (origB64) {
         const freshCrops = await cropGarmentsFromOriginal(origB64, boxes);
         if (freshCrops.length === boxes.length) {
-          let i = 0;
+          // Background rescue: any native crop that came back as JPEG had
+          // segmentation skipped (Vision didn't find a foreground for that
+          // patch). Re-run segmentItems on those crops to recover the cutout.
+          const rescued = await Promise.all(
+            freshCrops.map(async (uri) => rescueBackgroundIfMissing(uri)),
+          );
+          let visionIndex = 0;
+          let directIndex = 0;
           return mergePairShoeMetasInBatch(
-            prepared.map((m: any) => ({
-              ...m,
-              sourceUri:
-                m.box_2d && Array.isArray(m.box_2d)
-                  ? freshCrops[i++]
-                  : originalUri,
-              originalSourceUri: originalUri,
-              isIsolated: true,
-            })),
+            prepared.map((m: any) => {
+              if (isTinyWornAccessoryLike(m)) {
+                return directCrops[directIndex++] ?? m;
+              }
+              return {
+                ...m,
+                sourceUri:
+                  m.box_2d && Array.isArray(m.box_2d)
+                    ? rescued[visionIndex++]
+                    : originalUri,
+                originalSourceUri: originalUri,
+                isIsolated: true,
+              };
+            }),
           );
         }
       }
+    } else if (directCrops.length > 0) {
+      return directCrops;
     }
     // Fallback: plain tight crop (no background removal) if native Vision fails.
-    return mergePairShoeMetasInBatch(await jsFitCheckCrop(originalUri, prepared));
+    return mergePairShoeMetasInBatch(
+      await jsFitCheckCrop(originalUri, prepared),
+    );
   }
 
   // ── flat_lay: Vision segmentation + background removal ──────────────────
@@ -737,8 +1988,6 @@ async function cropItemsForFitCheck(
   return cropItemsByBoxes(originalUri, prepared, effectiveLayout, true);
 }
 
-
-
 /**
  * Crop each box from a single image (original file or data URI). Used as fallback when
  * masked+fallback native path is unavailable (e.g. Android).
@@ -754,17 +2003,19 @@ async function cropItemsByBoxes(
     if (boxesAlreadyExpanded) return { ...m };
     const minSpan = isShoeMeta(m)
       ? MIN_BOX_2D_SPAN_SHOE_FITCHECK
-      : isNeckJewelryLike(m)
-        ? MIN_BOX_2D_SPAN_NECKLACE_FITCHECK
-        : isTinyAccessoryLike(m)
-          ? MIN_BOX_2D_SPAN_ACCESSORY
-          : isFullBodyCategory(m)
-            ? MIN_BOX_2D_SPAN_FULL_BODY_FLATLAY
-            : isBottomsLike(m)
-              ? MIN_BOX_2D_SPAN_BOTTOMS_FLATLAY
-              : isTopGarment(m)
-                ? MIN_BOX_2D_SPAN_TOP_FLATLAY
-                : MIN_BOX_2D_SPAN;
+      : isHeadbandAccessoryLike(m) || isEyewearAccessoryLike(m)
+        ? MIN_BOX_2D_SPAN_HEAD_ACCESSORY_FITCHECK
+        : isNeckJewelryLike(m)
+          ? MIN_BOX_2D_SPAN_NECKLACE_FITCHECK
+          : isTinyAccessoryLike(m)
+            ? MIN_BOX_2D_SPAN_ACCESSORY
+            : isFullBodyCategory(m)
+              ? MIN_BOX_2D_SPAN_FULL_BODY_FLATLAY
+              : isBottomsLike(m)
+                ? MIN_BOX_2D_SPAN_BOTTOMS_FLATLAY
+                : isTopGarment(m)
+                  ? MIN_BOX_2D_SPAN_TOP_FLATLAY
+                  : MIN_BOX_2D_SPAN;
     let box = expandDegenerateBox2d(m.box_2d as number[], minSpan);
     if (isFullBodyCategory(m)) {
       box = expandBoxForFullBodyGarmentCrop(box, layoutMode);
@@ -773,7 +2024,7 @@ async function cropItemsByBoxes(
         box = expandBoxForTopGarmentCrop(box, layoutMode);
       }
       if (isBottomsLike(m)) {
-        box = expandBoxForBottomsGarmentCrop(box, layoutMode);
+        box = expandBoxForBottomsGarmentCrop(box, layoutMode, m);
       }
     }
     return { ...m, box_2d: box };
@@ -915,6 +2166,43 @@ async function shouldTreatSingleSegmentAsFitCheck(
 }
 
 /**
+ * Multiple Vision segments can still be one worn outfit/person (Vision splits
+ * jacket/hands/shoes into blobs). If we send those blobs down `per_segment`,
+ * each crop gets classified in isolation and the full outfit collapses to one
+ * item (e.g. only blazer). For portrait/OOTD photos, prefer full-frame
+ * fit-check classification whenever at least one segment looks person-sized.
+ */
+async function shouldTreatMultiSegmentsAsFitCheck(
+  originalUri: string,
+  segments: string[],
+): Promise<boolean> {
+  const orig = await getImagePixelSize(originalUri);
+  if (!orig) return false;
+  const origA = orig.w * orig.h;
+  const origAR = orig.w > 0 ? orig.h / orig.w : 1;
+  if (origA <= 0 || origAR < 1.08) return false;
+
+  const sizes = (
+    await Promise.all(segments.slice(0, 4).map((seg) => getImagePixelSize(seg)))
+  ).filter((s): s is { w: number; h: number } => !!s);
+  if (sizes.length === 0) return false;
+
+  const totalAreaFrac =
+    sizes.reduce((sum, s) => sum + s.w * s.h, 0) / Math.max(1, origA);
+  const largest = sizes.reduce((best, s) =>
+    s.w * s.h > best.w * best.h ? s : best,
+  );
+  const largestAreaFrac = (largest.w * largest.h) / origA;
+  const largestAR = largest.w > 0 ? largest.h / largest.w : 1;
+
+  // Portrait source + enough foreground coverage = person/OOTD. This avoids
+  // isolated crop classification stealing the whole upload.
+  if (origAR >= 1.15 && totalAreaFrac >= 0.18) return true;
+  if (largestAreaFrac >= 0.14 && largestAR >= 1.0) return true;
+  return false;
+}
+
+/**
  * Auto route: multi-instance → per crop; no masks → full-frame boxes; one mask → usually
  * `flat_lay_boxes` so we still find *multiple* garments (Vision often merges a whole outfit
  * into one foreground blob). Only mirror-style shots use `fit_check_boxes`.
@@ -923,7 +2211,11 @@ async function decideUploadSegmentStrategy(
   segments: string[],
   originalUri: string,
 ): Promise<AutoSegmentStrategy> {
-  if (segments.length >= 2) return "per_segment";
+  if (segments.length >= 2) {
+    return (await shouldTreatMultiSegmentsAsFitCheck(originalUri, segments))
+      ? "fit_check_boxes"
+      : "per_segment";
+  }
   if (segments.length === 0) return "flat_lay_boxes";
   const one = segments[0];
   if (!one) return "flat_lay_boxes";
@@ -940,7 +2232,8 @@ async function classifyAndCropBoxesFromPhoto(
   maskedSegmentUri: string | null,
   photoLayout: "flat_lay" | "fit_check",
 ): Promise<any[]> {
-  const classifyB64 = (await resizeForVision(uri)) || base64Fallback;
+  // 1024: box_2d precision matters more than payload here (one call per photo).
+  const classifyB64 = (await resizeForVision(uri, 1024)) || base64Fallback;
   const result = await apiClient.classify(
     classifyB64,
     "auto",
@@ -952,7 +2245,12 @@ async function classifyAndCropBoxesFromPhoto(
   ).filter(Boolean);
   const mergedShoeBoxes = mergeShoePairBoxesBeforeCrop(items);
   return mergePairShoeMetasInBatch(
-    await cropItemsForFitCheck(uri, maskedSegmentUri, mergedShoeBoxes, photoLayout),
+    await cropItemsForFitCheck(
+      uri,
+      maskedSegmentUri,
+      mergedShoeBoxes,
+      photoLayout,
+    ),
   );
 }
 
@@ -985,6 +2283,260 @@ async function fallbackClassifySingleCutout(
     console.warn("[upload] single-cutout fallback failed", e);
   }
   return null;
+}
+
+type AiMetaUpdater = (
+  fn: (prev: Record<string, unknown>[]) => Record<string, unknown>[],
+) => void;
+
+function reviewItemRowKey(
+  item: Record<string, unknown>,
+  idx: number,
+  fallbackImage?: string | null,
+): string {
+  if (typeof item._rowId === "string") return item._rowId;
+  if (typeof item._scanKey === "string") return item._scanKey;
+  return `${item.originalSourceUri ?? item.sourceUri ?? fallbackImage ?? "row"}-${idx}`;
+}
+
+/** Multi-detect only — returns Gemini metadata + box_2d, no crops yet. */
+async function detectBoxMetasFromPhoto(
+  uri: string,
+  base64Fallback: string,
+  photoLayout: "flat_lay" | "fit_check",
+): Promise<any[]> {
+  // 1024: box_2d precision matters more than payload here (one call per photo).
+  const classifyB64 = (await resizeForVision(uri, 1024)) || base64Fallback;
+  const result = await apiClient.classify(
+    classifyB64,
+    "auto",
+    "multi",
+    photoLayout,
+  );
+  const items = (
+    Array.isArray(result.metadata) ? result.metadata : [result.metadata]
+  ).filter(Boolean);
+  return mergeShoePairBoxesBeforeCrop(items);
+}
+
+/** All rows appear together on the full photo; classify in parallel, then swap to cutouts. */
+async function runPerSegmentClassifyProgressive(
+  photoUri: string,
+  segments: string[],
+  updateList: AiMetaUpdater,
+): Promise<number> {
+  let added = 0;
+  const scanKeys = segments.map(
+    (_, i) => `${photoUri}::seg::${i}::${Date.now()}`,
+  );
+
+  updateList((prev) => [
+    ...prev,
+    ...segments.map((seg, i) => ({
+      _rowId: scanKeys[i],
+      _scanKey: scanKeys[i],
+      _segmentUri: seg,
+      sourceUri: photoUri,
+      originalSourceUri: photoUri,
+      isIsolated: false,
+      _classifying: true,
+      name: "",
+    })),
+  ]);
+
+  await Promise.all(
+    segments.map(async (seg, si) => {
+      const scanKey = scanKeys[si]!;
+      try {
+        const segB64 = await resizeForVision(seg);
+        const result = await apiClient.classify(
+          segB64,
+          "auto",
+          "single",
+          undefined,
+          true,
+        );
+        const meta = Array.isArray(result.metadata)
+          ? result.metadata[0]
+          : result.metadata;
+        if (meta && typeof meta === "object") {
+          updateList((prev) => {
+            const idx = prev.findIndex(
+              (p) => p._rowId === scanKey || p._scanKey === scanKey,
+            );
+            if (idx === -1) return prev;
+            const next = [...prev];
+            next[idx] = {
+              ...meta,
+              _rowId: scanKey,
+              sourceUri: seg,
+              isIsolated: true,
+              originalSourceUri: photoUri,
+            };
+            return next;
+          });
+          added++;
+        } else {
+          updateList((prev) =>
+            prev.filter((p) => p._rowId !== scanKey && p._scanKey !== scanKey),
+          );
+        }
+      } catch (e) {
+        updateList((prev) =>
+          prev.filter((p) => p._rowId !== scanKey && p._scanKey !== scanKey),
+        );
+        console.warn("[upload] classify failed for segment", si, e);
+      }
+    }),
+  );
+
+  updateList((prev) => mergeShoeIsolatesForSegmentBatch(prev, segments));
+  return added;
+}
+
+/** Detect boxes, show every row at once on the full photo, then crop in parallel. */
+async function runBoxStrategyProgressive(
+  uri: string,
+  b64: string,
+  segments: string[],
+  photoLayout: "flat_lay" | "fit_check",
+  updateList: AiMetaUpdater,
+): Promise<number> {
+  const maskedSegmentUri =
+    photoLayout === "fit_check" && segments.length === 1 ? segments[0]! : null;
+  const metas = dedupeOverlappingBoxMetas(
+    await detectBoxMetasFromPhoto(uri, b64, photoLayout),
+  );
+
+  if (metas.length === 0 && segments.length === 1 && segments[0]) {
+    const scanKey = `${uri}::fb::${Date.now()}`;
+    updateList((prev) => [
+      ...prev,
+      {
+        _rowId: scanKey,
+        _scanKey: scanKey,
+        sourceUri: uri,
+        originalSourceUri: uri,
+        isIsolated: false,
+        _classifying: true,
+        name: "",
+      },
+    ]);
+    const fb = await fallbackClassifySingleCutout(segments[0], uri);
+    if (fb) {
+      updateList((prev) => {
+        const idx = prev.findIndex(
+          (p) => p._rowId === scanKey || p._scanKey === scanKey,
+        );
+        if (idx === -1) return prev;
+        const next = [...prev];
+        next[idx] = { ...fb, _rowId: scanKey, originalSourceUri: uri };
+        return next;
+      });
+      return 1;
+    }
+    updateList((prev) =>
+      prev.filter((p) => p._rowId !== scanKey && p._scanKey !== scanKey),
+    );
+    return 0;
+  }
+
+  const scanKeys = metas.map(
+    (_, i) => `${uri}::box::${i}::${Date.now()}`,
+  );
+
+  updateList((prev) => [
+    ...prev,
+    ...metas.map((meta, i) => ({
+      _rowId: scanKeys[i],
+      _scanKey: scanKeys[i],
+      sourceUri: uri,
+      originalSourceUri: uri,
+      isIsolated: false,
+      box_2d: meta.box_2d,
+      _classifying: true,
+      name: "",
+    })),
+  ]);
+
+  let added = 0;
+  await Promise.all(
+    metas.map(async (meta, i) => {
+      const scanKey = scanKeys[i]!;
+      try {
+        const cropped = mergePairShoeMetasInBatch(
+          await cropItemsForFitCheck(
+            uri,
+            maskedSegmentUri,
+            [meta],
+            photoLayout,
+          ),
+        );
+        const item = cropped[0];
+        if (!item) {
+          updateList((prev) =>
+            prev.filter((p) => p._rowId !== scanKey && p._scanKey !== scanKey),
+          );
+          return;
+        }
+        updateList((prev) => {
+          const idx = prev.findIndex(
+            (p) => p._rowId === scanKey || p._scanKey === scanKey,
+          );
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = {
+            ...item,
+            _rowId: scanKey,
+            originalSourceUri: uri,
+          };
+          return next;
+        });
+        added++;
+      } catch (e) {
+        updateList((prev) =>
+          prev.filter((p) => p._rowId !== scanKey && p._scanKey !== scanKey),
+        );
+        console.warn("[upload] box crop failed", i, e);
+      }
+    }),
+  );
+  return added;
+}
+
+/** Progressive garment detect + classify (shared by log-outfit and library
+ * fit extract). Returns how many items were detected so callers can handle
+ * the "found nothing" case instead of stalling on an empty review. */
+export async function runProgressiveImageExtract(
+  base64: string,
+  uri: string,
+  updateList: AiMetaUpdater,
+): Promise<number> {
+  const segments = await segmentItems(base64);
+  const strategy = await decideUploadSegmentStrategy(segments, uri);
+
+  if (strategy === "per_segment") {
+    updateList(() => []);
+    return await runPerSegmentClassifyProgressive(uri, segments, updateList);
+  } else if (strategy === "flat_lay_boxes") {
+    updateList(() => []);
+    return await runBoxStrategyProgressive(
+      uri,
+      base64,
+      segments,
+      "flat_lay",
+      updateList,
+    );
+  } else {
+    updateList(() => []);
+    return await runBoxStrategyProgressive(
+      uri,
+      base64,
+      segments,
+      "fit_check",
+      updateList,
+    );
+  }
 }
 
 const MAX_LIBRARY_PHOTOS = 20;
@@ -1107,13 +2659,7 @@ const ArcCheck = ({ color }: { color: string }) => (
   </Svg>
 );
 
-const ArcFlashIcon = ({
-  mode,
-  color,
-}: {
-  mode: "off" | "on" | "torch";
-  color: string;
-}) => (
+const ArcFlashIcon = ({ mode, color }: { mode: FlashMode; color: string }) => (
   <Svg width="20" height="20" viewBox="0 0 24 24">
     <Path
       d="M13 2L4 13h7l-1 9 9-11h-7l1-9z"
@@ -1214,7 +2760,7 @@ function formatUnknownError(e: unknown): string {
   }
 }
 
-async function uriToBase64(uri: string): Promise<string> {
+export async function uriToBase64(uri: string): Promise<string> {
   const res = await fetch(uri);
   const blob = await res.blob();
   return new Promise((resolve, reject) => {
@@ -1243,12 +2789,54 @@ async function imageUriToPlainBase64(uri: string): Promise<string> {
 
 export default function AddScreen() {
   const router = useRouter();
+  const pathname = usePathname();
   const insets = useSafeAreaInsets();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const isLogOutfitRoute =
+    pathname === "/log-outfit" || pathname.endsWith("/log-outfit");
+  const isFitExtractRoute =
+    pathname === "/fit-extract" || pathname.endsWith("/fit-extract");
   const params = useLocalSearchParams<{
     library?: string | string[];
     categoryHint?: string | string[];
+    mode?: string | string[];
+    wornOnIso?: string | string[];
+    plannedDateIso?: string | string[];
+    outfitId?: string | string[];
+    outfitImageUrl?: string | string[];
+    restoreUpload?: string | string[];
+    restoreOutfit?: string | string[];
   }>();
   const { user } = useUser();
+  const isOutfitMode = useMemo(() => {
+    const m = params.mode;
+    const v = Array.isArray(m) ? m[0] : m;
+    return v === "outfit" || isLogOutfitRoute;
+  }, [params.mode, isLogOutfitRoute]);
+  const extractOutfitId = useMemo(() => {
+    const raw = params.outfitId;
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+  }, [params.outfitId]);
+  const isExtractForOutfitMode = useMemo(() => {
+    const m = params.mode;
+    const v = Array.isArray(m) ? m[0] : m;
+    return (
+      (v === "extract" && !!extractOutfitId) ||
+      (isFitExtractRoute && !!extractOutfitId)
+    );
+  }, [params.mode, extractOutfitId, isFitExtractRoute]);
+  const outfitImageUrlParam = useMemo(() => {
+    const raw = params.outfitImageUrl;
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof v !== "string" || v.length < 8) return null;
+    const trimmed = v.trim();
+    try {
+      return decodeURIComponent(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }, [params.outfitImageUrl]);
   const [uploadSource, setUploadSource] = useState<"camera" | "library">(() =>
     consumeLibraryIntent() || isLibraryMenuIntent(params.library)
       ? "library"
@@ -1257,7 +2845,13 @@ export default function AddScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [image, setImage] = useState<string | null>(null);
   const [status, setStatus] = useState<
-    "scanning" | "analyzing" | "review" | "done"
+    | "scanning"
+    | "analyzing"
+    | "review"
+    | "done"
+    | "outfit_review"
+    | "outfit_processing"
+    | "outfit_isolating"
   >("scanning");
   const [uploading, setUploading] = useState(false);
   const [libraryAutoPickPending, setLibraryAutoPickPending] = useState(() =>
@@ -1265,7 +2859,6 @@ export default function AddScreen() {
   );
   const [libraryPickerOpen, setLibraryPickerOpen] = useState(false);
   const [editIndex, setEditIndex] = useState<number | null>(null);
-  const [configCarouselPage, setConfigCarouselPage] = useState(0);
   const [editForm, setEditForm] = useState({
     name: "",
     category: "",
@@ -1273,6 +2866,8 @@ export default function AddScreen() {
     occasions: [] as string[],
     seasons: [] as string[],
   });
+  /** Manual crop modal target — index into aiMetaList. */
+  const [manualCropIndex, setManualCropIndex] = useState<number | null>(null);
 
   /** Fits / closet “Add Outerwear” etc. — same shelf ids as Closet tab (top, outerwear, …). */
   const categoryHintShelfId = useMemo(() => {
@@ -1287,12 +2882,84 @@ export default function AddScreen() {
     return shelfIdForCategoryChip(hint) ?? "";
   }, [params.categoryHint]);
   const [uploadColorPickerOpen, setUploadColorPickerOpen] = useState(false);
+  /** When set, configure modal edits `extractItems` on this draft (mirrored via aiMetaList). */
+  const [outfitExtractEditDraftId, setOutfitExtractEditDraftId] = useState<
+    string | null
+  >(null);
+  /** Full scan-in review sheet over outfit review (same UI as item upload). */
+  const [outfitExtractReviewDraftId, setOutfitExtractReviewDraftId] = useState<
+    string | null
+  >(null);
+  const outfitExtractEditSnapshotRef = useRef<
+    Record<string, unknown>[] | null
+  >(null);
   const [previewUri, setPreviewUri] = useState<string | null>(null);
-  /** Page index for Configure fullscreen pager (isolated vs original). */
-  const [previewFullscreenPage, setPreviewFullscreenPage] = useState(0);
-  const previewFullscreenScrollRef =
-    useRef<React.ComponentRef<typeof GHScrollView>>(null);
   const [addMoreSheetOpen, setAddMoreSheetOpen] = useState(false);
+
+  /** Full-body outfit photo — no per-item segmentation */
+  const [outfitName, setOutfitName] = useState("");
+  const [outfitSchedule, setOutfitSchedule] = useState<
+    "none" | "today" | "pick"
+  >("none");
+  const [outfitPickIso, setOutfitPickIso] = useState<string | null>(null);
+
+  const paramWearIso = useMemo(() => {
+    const raw = params.wornOnIso ?? params.plannedDateIso;
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    return typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v.trim())
+      ? v.trim()
+      : null;
+  }, [params.wornOnIso, params.plannedDateIso]);
+
+  useEffect(() => {
+    if (!isOutfitMode || !paramWearIso) return;
+    setOutfitSchedule("pick");
+    setOutfitPickIso(paramWearIso);
+  }, [isOutfitMode, paramWearIso]);
+  const [savingOutfitPhoto, setSavingOutfitPhoto] = useState(false);
+  /** After outfit-only save, link extracted items to this outfit on closet save. */
+  const [pendingLinkOutfitId, setPendingLinkOutfitId] = useState<string | null>(
+    null,
+  );
+  const outfitOriginalUriRef = useRef<string | null>(null);
+  const extractBootstrappedRef = useRef(false);
+  const activeLinkOutfitId = extractOutfitId ?? pendingLinkOutfitId;
+  const [outfitDrafts, setOutfitDrafts] = useState<OutfitUploadDraft[]>([]);
+  const outfitDraftsRef = useRef<OutfitUploadDraft[]>([]);
+  const handleOutfitLeaveRef = useRef<() => void>(() => {});
+  /** Remaining JPEG URIs after the current outfit review (legacy sequential batch). */
+  const [outfitReviewQueue, setOutfitReviewQueue] = useState<string[]>([]);
+  const outfitReviewQueueRef = useRef<string[]>([]);
+  /** Set when the user started a multi-photo outfit batch (camera or library). */
+  const [outfitReviewBatch, setOutfitReviewBatch] = useState<{
+    index: number;
+    total: number;
+  } | null>(null);
+  const outfitReviewBatchRef = useRef<{
+    index: number;
+    total: number;
+  } | null>(null);
+  useEffect(() => {
+    outfitReviewBatchRef.current = outfitReviewBatch;
+  }, [outfitReviewBatch]);
+
+  const replaceOutfitReviewQueue = useCallback((uris: string[]) => {
+    outfitReviewQueueRef.current = uris;
+    setOutfitReviewQueue(uris);
+  }, []);
+
+  const syncOutfitDrafts = useCallback((next: OutfitUploadDraft[]) => {
+    outfitDraftsRef.current = next;
+    setOutfitDrafts(next);
+  }, []);
+
+  const defaultDraftSchedule = useCallback((): Pick<
+    OutfitUploadDraft,
+    "schedule" | "pickIso"
+  > => {
+    if (paramWearIso) return { schedule: "pick", pickIso: paramWearIso };
+    return { schedule: "none", pickIso: null };
+  }, [paramWearIso]);
 
   /** Progress when analyzing multiple library photos before one combined review */
   const [batchAnalyze, setBatchAnalyze] = useState<{
@@ -1307,11 +2974,67 @@ export default function AddScreen() {
   // Array of parsed items
   const [aiMetaList, setAiMetaList] = useState<any[]>([]);
 
+  const recoverySessionRef = useRef<UploadRecoverySession | null>(null);
+  const uploadRestoreHandledRef = useRef(false);
+  const persistReviewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const restoreUploadParam = useMemo(() => {
+    const raw = params.restoreUpload;
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    return v === "1" || v === "true";
+  }, [params.restoreUpload]);
+  const restoreOutfitParam = useMemo(() => {
+    const raw = params.restoreOutfit;
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    return v === "1" || v === "true";
+  }, [params.restoreOutfit]);
+  const uploadUserId = effectiveUploadUserId(user?.id);
+  const outfitRecoverySessionRef = useRef<OutfitUploadRecoverySession | null>(
+    null,
+  );
+  const outfitPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const persistOutfitDraftsToSession = useCallback(
+    async (
+      drafts: OutfitUploadDraft[],
+      phase: "processing" | "isolating" | "review" = "review",
+    ) => {
+      const session = await persistOutfitUploadSession({
+        userId: uploadUserId,
+        phase,
+        uploadSource,
+        pendingUris: [],
+        drafts: drafts.map((d) => ({
+          id: d.id,
+          heroUri: d.heroUri,
+          originalUri: d.originalUri,
+          name: d.name,
+          schedule: d.schedule,
+          pickIso: d.pickIso,
+        })),
+        existingSession: outfitRecoverySessionRef.current,
+      });
+      if (session) outfitRecoverySessionRef.current = session;
+    },
+    [uploadSource, uploadUserId],
+  );
+
+  const isMountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      isMountedRef.current = false;
+    },
+    [],
+  );
+
   const cameraRef = useRef<CameraView>(null);
   const cameraZoomRef = useRef(0);
   const pinchBaseZoomRef = useRef(0);
   const [facing, setFacing] = useState<"back" | "front">("back");
-  const [flash, setFlash] = useState<"off" | "on" | "torch">("off");
+  const [flash, setFlash] = useState<FlashMode>("off");
   /** 0–1 maps to device max optical zoom (expo-camera `CameraView` `zoom` prop). */
   const [cameraZoom, setCameraZoom] = useState(0);
 
@@ -1339,6 +3062,15 @@ export default function AddScreen() {
   const pickImagesRef = useRef<() => Promise<void>>(async () => {});
   /** When true, handleDoneCapturing appends new items instead of replacing the review list. */
   const appendToReviewRef = useRef(false);
+  const reviewScrollRef = useRef<ScrollView>(null);
+  /** Pin review list to bottom while + Add scan is in progress. */
+  const pinReviewScrollToAppendRef = useRef(false);
+
+  const scrollReviewToEnd = useCallback((animated = true) => {
+    requestAnimationFrame(() => {
+      reviewScrollRef.current?.scrollToEnd({ animated });
+    });
+  }, []);
 
   const tabBarOverlay = Math.max(insets.bottom, 10);
   const reviewStickyBarHeight = 88;
@@ -1352,270 +3084,265 @@ export default function AddScreen() {
   const donePhotoCount = [
     ...new Set(aiMetaList.map((i) => i.sourceUri ?? image).filter(Boolean)),
   ].length;
-
-  /** Jump fullscreen pager to the image that was tapped (isolated vs original). */
-  useEffect(() => {
-    if (previewUri == null || editIndex == null) return;
-    const editItem = aiMetaList[editIndex];
-    const orig = editItem?.originalSourceUri;
-    if (!orig || !editItem?.sourceUri) return;
-    const page = previewUri === orig ? 1 : 0;
-    setPreviewFullscreenPage(page);
-    const id = requestAnimationFrame(() => {
-      previewFullscreenScrollRef.current?.scrollTo({
-        x: page * width,
-        y: 0,
-        animated: false,
-      });
-    });
-    return () => cancelAnimationFrame(id);
-  }, [previewUri, editIndex, aiMetaList]);
-
-  const processImage = async (base64: string, uri: string) => {
-    setImage(uri);
-    setStatus("analyzing");
-    try {
-      const segments = await segmentItems(base64);
-      const strategy = await decideUploadSegmentStrategy(segments, uri);
-
-      if (strategy === "per_segment") {
-        // One or more white-bg Vision crops — classify each in isolation
-        setImage(uri);
-        setStatus("review");
-        setAiMetaList(
-          segments.map((seg) => ({
-            sourceUri: seg,
-            originalSourceUri: uri,
-            isIsolated: true,
-            _classifying: true,
-            name: "",
-          })),
-        );
-
-        await Promise.all(
-          segments.map(async (seg, si) => {
-            try {
-              const segB64 = await resizeForVision(seg);
-              const result = await apiClient.classify(
-                segB64,
-                "auto",
-                "single",
-                undefined,
-                true,
-              );
-              const meta = Array.isArray(result.metadata)
-                ? result.metadata[0]
-                : result.metadata;
-              if (meta && typeof meta === "object") {
-                setAiMetaList((prev) => {
-                  const idx = prev.findIndex(
-                    (p) => p.sourceUri === seg && p._classifying,
-                  );
-                  if (idx === -1) return prev;
-                  const next = [...prev];
-                  next[idx] = {
-                    ...meta,
-                    sourceUri: seg,
-                    isIsolated: true,
-                    originalSourceUri: uri,
-                  };
-                  return next;
-                });
-              }
-            } catch (e) {
-              setAiMetaList((prev) =>
-                prev.filter((p) => !(p.sourceUri === seg && p._classifying)),
-              );
-              console.warn("[upload] classify failed for segment", si, e);
-            }
-          }),
-        );
-        setAiMetaList((prev) =>
-          mergeShoeIsolatesForSegmentBatch(prev, segments),
-        );
-      } else if (strategy === "flat_lay_boxes") {
-        // Full-frame multi-box; if nothing found but we have one Vision mask, classify it.
-        setStatus("review");
-        setAiMetaList([
-          { sourceUri: uri, isIsolated: true, _classifying: true, name: "" },
-        ]);
-        let resolved = await classifyAndCropBoxesFromPhoto(
-          uri,
-          base64,
-          null,
-          "flat_lay",
-        );
-        if (resolved.length === 0 && segments.length === 1 && segments[0]) {
-          const fb = await fallbackClassifySingleCutout(segments[0], uri);
-          resolved = fb ? [fb] : [];
-        }
-        setAiMetaList(resolved.length > 0 ? resolved : []);
-        if (resolved.length > 0) setImage(resolved[0].sourceUri);
-      } else {
-        // Worn outfit / large subject: fit_check on original + per-box crops
-        const srcUri = segments.length === 1 ? segments[0] : uri;
-        if (segments.length === 1) setImage(segments[0]);
-        setStatus("review");
-        setAiMetaList([
-          { sourceUri: srcUri, isIsolated: true, _classifying: true, name: "" },
-        ]);
-
-        const resolved = await classifyAndCropBoxesFromPhoto(
-          uri,
-          base64,
-          segments.length === 1 ? segments[0] : null,
-          "fit_check",
-        );
-        setAiMetaList(resolved.length > 0 ? resolved : []);
+  const classifyingCount = useMemo(
+    () => aiMetaList.filter((i) => isItemClassifying(i)).length,
+    [aiMetaList],
+  );
+  const reviewEnhancing = aiMetaList.some((i) => i._enhancing);
+  const reviewItemsStillLoading = aiMetaList.some((i) => isItemClassifying(i));
+  const reviewScanActive = !!(batchAnalyze || reviewItemsStillLoading);
+  /** One ghost row while we wait for detection — never alongside real placeholders. */
+  const showScanGapSkeleton = reviewScanActive && classifyingCount === 0;
+  const reviewHeaderTitle = useMemo(() => {
+    const n = aiMetaList.length;
+    return n > 0 ? `Review items (${n})` : "Review items";
+  }, [aiMetaList.length]);
+  const reviewScanSubtitle = useMemo(() => {
+    if (!reviewScanActive) {
+      return "Check the details before these hit your closet.";
+    }
+    const n = aiMetaList.length;
+    if (n === 0) {
+      if (batchAnalyze && batchAnalyze.total > 1) {
+        const photo = Math.min(batchAnalyze.current + 1, batchAnalyze.total);
+        return `Scanning photo ${photo} of ${batchAnalyze.total}…`;
       }
+      return "Finding pieces in your photo…";
+    }
+    if (classifyingCount > 0) {
+      if (
+        batchAnalyze &&
+        batchAnalyze.total > 1 &&
+        batchAnalyze.current < batchAnalyze.total
+      ) {
+        return `${n} found · scanning more photos…`;
+      }
+      return n === 1
+        ? "Identifying this piece…"
+        : `Identifying ${classifyingCount} pieces…`;
+    }
+    if (batchAnalyze && batchAnalyze.current < batchAnalyze.total) {
+      return `${n} found · photo ${batchAnalyze.current + 1} of ${batchAnalyze.total}…`;
+    }
+    return "";
+  }, [reviewScanActive, aiMetaList, batchAnalyze, classifyingCount]);
+  const showReviewAppendLoading =
+    !!batchAnalyze &&
+    batchAnalyze.total > 1 &&
+    reviewScanActive &&
+    batchAnalyze.current < batchAnalyze.total;
+  const reviewSaveBlocked =
+    !aiMetaList.length ||
+    uploading ||
+    reviewItemsStillLoading ||
+    reviewEnhancing ||
+    !!batchAnalyze;
+
+  useEffect(() => {
+    if (!pinReviewScrollToAppendRef.current) return;
+    if (status !== "review" && status !== "analyzing") return;
+    scrollReviewToEnd(true);
+  }, [
+    aiMetaList.length,
+    batchAnalyze,
+    reviewScanActive,
+    showScanGapSkeleton,
+    classifyingCount,
+    status,
+    scrollReviewToEnd,
+  ]);
+
+  useEffect(() => {
+    if (!pinReviewScrollToAppendRef.current) return;
+    if (status === "review" && !reviewScanActive) {
+      pinReviewScrollToAppendRef.current = false;
+      scrollReviewToEnd(true);
+    }
+  }, [reviewScanActive, status, scrollReviewToEnd]);
+
+  const prepareOutfitDraftBatch = useCallback(
+    async (uris: string[], opts?: { append?: boolean }) => {
+      if (uris.length === 0) return;
+      setStatus("outfit_processing");
+      setBatchAnalyze({ current: 0, total: uris.length });
+      const base = opts?.append ? [...outfitDraftsRef.current] : [];
+      const schedDefaults = defaultDraftSchedule();
+      try {
+        for (let i = 0; i < uris.length; i++) {
+          setBatchAnalyze({ current: i + 1, total: uris.length });
+          const { heroUri, originalUri } = await buildOutfitHeroFromUri(
+            uris[i]!,
+          );
+          if (!isMountedRef.current) return;
+          base.push({
+            id: newOutfitDraftId(),
+            heroUri,
+            originalUri,
+            name: "",
+            ...schedDefaults,
+          });
+        }
+        syncOutfitDrafts(base);
+        setBatchAnalyze(null);
+        setCapturedPhotos([]);
+        replaceOutfitReviewQueue([]);
+        setOutfitReviewBatch(null);
+        setStatus("outfit_review");
+        await persistOutfitDraftsToSession(base, "review");
+      } catch (e) {
+        setBatchAnalyze(null);
+        Alert.alert("Could not prepare looks", formatUnknownError(e));
+        if (base.length > 0) {
+          syncOutfitDrafts(base);
+          setStatus("outfit_review");
+          await persistOutfitDraftsToSession(base, "review");
+        } else {
+          setStatus("scanning");
+        }
+      }
+    },
+    [
+      defaultDraftSchedule,
+      persistOutfitDraftsToSession,
+      replaceOutfitReviewQueue,
+      syncOutfitDrafts,
+    ],
+  );
+
+  const datePickOptions = useMemo(() => {
+    const out: { iso: string; label: string }[] = [];
+    const start = new Date();
+    start.setDate(start.getDate() - 21);
+    start.setHours(12, 0, 0, 0);
+    for (let i = 0; i < 100; i++) {
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      const iso = d.toISOString().split("T")[0]!;
+      out.push({
+        iso,
+        label: d.toLocaleDateString("en-US", {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+        }),
+      });
+    }
+    return out;
+  }, []);
+
+  const processImageInto = async (
+    base64: string,
+    uri: string,
+    updateList: AiMetaUpdater,
+  ): Promise<number> => {
+    setBatchAnalyze({ current: 0, total: 1 });
+    try {
+      return await runProgressiveImageExtract(base64, uri, updateList);
     } catch (err) {
       console.error(err);
-      setAiMetaList([]);
-      setStatus("scanning");
-      Alert.alert("AI extraction failed", formatUnknownError(err));
+      updateList(() => []);
+      throw err;
+    } finally {
+      setBatchAnalyze(null);
     }
   };
 
-  /** All selected photos → all processed in parallel, items appear as each photo completes */
+  const processImage = async (base64: string, uri: string): Promise<number> => {
+    setImage(uri);
+    setStatus("review");
+    try {
+      return await processImageInto(base64, uri, setAiMetaList);
+    } catch (err) {
+      setAiMetaList([]);
+      // In extract-for-outfit mode the full-screen bootstrap owns terminal
+      // handling (message + navigate back). Rethrow so it can react instead
+      // of leaving the "Extracting pieces…" spinner stuck on screen forever.
+      if (isExtractForOutfitMode) throw err;
+      setStatus("scanning");
+      Alert.alert("AI extraction failed", formatUnknownError(err));
+      return 0;
+    }
+  };
+
+  /** Selected photos processed in order; batch progress updates after each photo finishes */
   const analyzeAllLibraryPhotos = async (jpegUris: string[]) => {
     if (jpegUris.length === 0) return;
+    if (isOutfitMode && !appendToReviewRef.current && jpegUris[0]) {
+      try {
+        await prepareOutfitDraftBatch(jpegUris);
+      } catch (e) {
+        Alert.alert("Could not use photo", formatUnknownError(e));
+        setStatus("scanning");
+      }
+      return;
+    }
     setUploadSource("library");
     setLibraryBanner(null);
     setLibrarySettingsCta(false);
-    setAiMetaList([]);
-    setStatus("analyzing");
-    setBatchAnalyze({ current: 0, total: jpegUris.length });
-    setImage(jpegUris[0]);
+    if (!appendToReviewRef.current) {
+      setAiMetaList([]);
+      setImage(jpegUris[0]);
+      setStatus("review");
+    }
 
     let reviewShown = false;
-    let completedCount = 0;
     let totalAdded = 0;
 
     try {
-      await Promise.all(
-        jpegUris.map(async (uri, i) => {
-          try {
-            const b64 = await uriToBase64(uri);
+      for (let i = 0; i < jpegUris.length; i++) {
+        const uri = jpegUris[i];
+        try {
+          const b64 = await uriToBase64(uri);
 
-            // Step 1: segment on-device (~300-600ms)
-            const segments = await segmentItems(b64);
-            const strategy = await decideUploadSegmentStrategy(segments, uri);
+          // Step 1: segment on-device (~300-600ms)
+          const segments = await segmentItems(b64);
+          const strategy = await decideUploadSegmentStrategy(segments, uri);
 
-            if (strategy === "per_segment") {
-              if (!reviewShown) {
-                reviewShown = true;
-                setImage(uri);
-                setStatus("review");
-              }
-              setAiMetaList((prev) => [
-                ...prev,
-                ...segments.map((seg) => ({
-                  sourceUri: seg,
-                  originalSourceUri: uri,
-                  isIsolated: true,
-                  _classifying: true,
-                  name: "",
-                })),
-              ]);
-
-              await Promise.all(
-                segments.map(async (seg, si) => {
-                  try {
-                    const segB64 = await resizeForVision(seg);
-                    const result = await apiClient.classify(
-                      segB64,
-                      "auto",
-                      "single",
-                      undefined,
-                      true,
-                    );
-                    const meta = Array.isArray(result.metadata)
-                      ? result.metadata[0]
-                      : result.metadata;
-                    if (meta && typeof meta === "object") {
-                      setAiMetaList((prev) => {
-                        const idx = prev.findIndex(
-                          (p) => p.sourceUri === seg && p._classifying,
-                        );
-                        if (idx === -1) return prev;
-                        const next = [...prev];
-                        next[idx] = {
-                          ...meta,
-                          sourceUri: seg,
-                          isIsolated: true,
-                          originalSourceUri: uri,
-                        };
-                        return next;
-                      });
-                      totalAdded++;
-                    }
-                  } catch (e) {
-                    setAiMetaList((prev) =>
-                      prev.filter(
-                        (p) => !(p.sourceUri === seg && p._classifying),
-                      ),
-                    );
-                    console.warn("[upload] classify failed for segment", si, e);
-                  }
-                }),
-              );
-              setAiMetaList((prev) =>
-                mergeShoeIsolatesForSegmentBatch(prev, segments),
-              );
-            } else if (strategy === "flat_lay_boxes") {
-              let cropped = await classifyAndCropBoxesFromPhoto(
-                uri,
-                b64,
-                null,
-                "flat_lay",
-              );
-              if (
-                cropped.length === 0 &&
-                segments.length === 1 &&
-                segments[0]
-              ) {
-                const fb = await fallbackClassifySingleCutout(segments[0], uri);
-                cropped = fb ? [fb] : [];
-              }
-              if (cropped.length > 0) {
-                if (!reviewShown) {
-                  reviewShown = true;
-                  setImage(cropped[0].sourceUri);
-                  setStatus("review");
-                }
-                setAiMetaList((prev) => [...prev, ...cropped]);
-                totalAdded += cropped.length;
-              }
-            } else {
-              const srcUri = segments.length === 1 ? segments[0] : uri;
-              const cropped = await classifyAndCropBoxesFromPhoto(
-                uri,
-                b64,
-                segments.length === 1 ? segments[0] : null,
-                "fit_check",
-              );
-              if (cropped.length > 0) {
-                if (!reviewShown) {
-                  reviewShown = true;
-                  setImage(srcUri);
-                  setStatus("review");
-                }
-                setAiMetaList((prev) => [...prev, ...cropped]);
-                totalAdded += cropped.length;
-              }
+          if (strategy === "per_segment") {
+            if (!reviewShown && !appendToReviewRef.current) {
+              reviewShown = true;
+              setImage(uri);
             }
-          } catch (e) {
-            console.warn("[upload] failed for photo", i + 1, e);
-          } finally {
-            completedCount++;
-            setBatchAnalyze((prev) =>
-              prev ? { current: completedCount, total: jpegUris.length } : null,
+            setStatus("review");
+            totalAdded += await runPerSegmentClassifyProgressive(
+              uri,
+              segments,
+              setAiMetaList,
+            );
+          } else if (strategy === "flat_lay_boxes") {
+            if (!reviewShown && !appendToReviewRef.current) {
+              reviewShown = true;
+              setImage(uri);
+            }
+            setStatus("review");
+            totalAdded += await runBoxStrategyProgressive(
+              uri,
+              b64,
+              segments,
+              "flat_lay",
+              setAiMetaList,
+            );
+          } else {
+            if (!reviewShown && !appendToReviewRef.current) {
+              reviewShown = true;
+              setImage(uri);
+            }
+            setStatus("review");
+            totalAdded += await runBoxStrategyProgressive(
+              uri,
+              b64,
+              segments,
+              "fit_check",
+              setAiMetaList,
             );
           }
-        }),
-      );
+        } catch (e) {
+          console.warn("[upload] failed for photo", i + 1, e);
+        }
+        setBatchAnalyze({ current: i + 1, total: jpegUris.length });
+      }
 
-      if (totalAdded === 0) {
+      if (totalAdded === 0 && !appendToReviewRef.current) {
         setAiMetaList([]);
         setStatus("scanning");
         Alert.alert(
@@ -1655,17 +3382,71 @@ export default function AddScreen() {
       appendToReviewRef.current = false;
       return;
     }
+    if (isOutfitMode && !appendToReviewRef.current) {
+      appendToReviewRef.current = false;
+      const toProcess = [...capturedPhotos];
+      const rawUris = toProcess.map((p) => p.uri);
+      setCapturedPhotos([]);
+      try {
+        const processingSession = await persistOutfitUploadSession({
+          userId: uploadUserId,
+          phase: "processing",
+          uploadSource: "camera",
+          pendingUris: rawUris,
+          existingSession: outfitRecoverySessionRef.current,
+        });
+        if (processingSession) {
+          outfitRecoverySessionRef.current = processingSession;
+        }
+        const jpegs = await Promise.all(
+          toProcess.map((p) => ensureJpegUri(p.uri)),
+        );
+        if (jpegs.length === 0) {
+          setStatus("scanning");
+          return;
+        }
+        await prepareOutfitDraftBatch(jpegs);
+      } catch (e) {
+        console.warn(e);
+        Alert.alert("Could not use photo", formatUnknownError(e));
+        setStatus("scanning");
+      }
+      return;
+    }
     if (!appendToReviewRef.current) {
       setAiMetaList([]);
+      setImage(capturedPhotos[0].uri);
     }
-    setStatus("analyzing");
-    setBatchAnalyze({ current: 0, total: capturedPhotos.length });
+    const toProcess = [...capturedPhotos];
+    const rawUris = toProcess.map((p) => p.uri);
+    const existingItemsSnapshot = appendToReviewRef.current
+      ? [...aiMetaList]
+      : [];
+    setCapturedPhotos([]);
+    setStatus("review");
+    setBatchAnalyze({ current: 0, total: toProcess.length });
+    if (appendToReviewRef.current) {
+      pinReviewScrollToAppendRef.current = true;
+      scrollReviewToEnd(false);
+    }
+
+    const queuedSession = await persistUploadReviewSession({
+      userId: uploadUserId,
+      aiMetaList: existingItemsSnapshot,
+      imageUri: rawUris[0] ?? image,
+      pendingPhotoUris: rawUris,
+      uploadSource: "camera",
+      sessionStatus: "queued",
+      linkOutfitId: activeLinkOutfitId,
+      existingSession: recoverySessionRef.current,
+    });
+    if (queuedSession) recoverySessionRef.current = queuedSession;
+
     let addedCount = 0;
 
     try {
-      for (let i = 0; i < capturedPhotos.length; i++) {
-        setBatchAnalyze({ current: i + 1, total: capturedPhotos.length });
-        const photo = capturedPhotos[i];
+      for (let i = 0; i < toProcess.length; i++) {
+        const photo = toProcess[i];
         try {
           // Always re-segment from full capture so multi-item flat lays are not reduced to the first instance.
           const segments = await segmentItems(photo.base64);
@@ -1675,107 +3456,44 @@ export default function AddScreen() {
           );
 
           if (strategy === "per_segment") {
-            if (addedCount === 0) {
-              // Full capture for review context; each row still uses the isolated `sourceUri`.
+            if (addedCount === 0 && !appendToReviewRef.current) {
               setImage(photo.uri);
-              setStatus("review");
             }
-            setAiMetaList((prev) => [
-              ...prev,
-              ...segments.map((seg) => ({
-                sourceUri: seg,
-                originalSourceUri: photo.uri,
-                isIsolated: true,
-                _classifying: true,
-                name: "",
-              })),
-            ]);
-
-            await Promise.all(
-              segments.map(async (seg) => {
-                try {
-                  const segB64 = await resizeForVision(seg);
-                  const result = await apiClient.classify(
-                    segB64,
-                    "auto",
-                    "single",
-                    undefined,
-                    true,
-                  );
-                  const meta = Array.isArray(result.metadata)
-                    ? result.metadata[0]
-                    : result.metadata;
-                  if (meta && typeof meta === "object") {
-                    setAiMetaList((prev) => {
-                      const idx = prev.findIndex(
-                        (p) => p.sourceUri === seg && p._classifying,
-                      );
-                      if (idx === -1) return prev;
-                      const next = [...prev];
-                      next[idx] = {
-                        ...meta,
-                        sourceUri: seg,
-                        isIsolated: true,
-                        originalSourceUri: photo.uri,
-                      };
-                      return next;
-                    });
-                    addedCount++;
-                  }
-                } catch {
-                  setAiMetaList((prev) =>
-                    prev.filter(
-                      (p) => !(p.sourceUri === seg && p._classifying),
-                    ),
-                  );
-                }
-              }),
-            );
-            setAiMetaList((prev) =>
-              mergeShoeIsolatesForSegmentBatch(prev, segments),
+            setStatus("review");
+            addedCount += await runPerSegmentClassifyProgressive(
+              photo.uri,
+              segments,
+              setAiMetaList,
             );
           } else if (strategy === "flat_lay_boxes") {
-            let cropped = await classifyAndCropBoxesFromPhoto(
+            if (addedCount === 0 && !appendToReviewRef.current) {
+              setImage(photo.uri);
+            }
+            setStatus("review");
+            addedCount += await runBoxStrategyProgressive(
               photo.uri,
               photo.base64,
-              null,
+              segments,
               "flat_lay",
+              setAiMetaList,
             );
-            if (cropped.length === 0 && segments.length === 1 && segments[0]) {
-              const fb = await fallbackClassifySingleCutout(
-                segments[0],
-                photo.uri,
-              );
-              cropped = fb ? [fb] : [];
-            }
-            if (cropped.length > 0 && i === 0) {
-              setImage(cropped[0].sourceUri);
-              setStatus("review");
-            }
-            for (const item of cropped) {
-              setAiMetaList((prev) => [...prev, item]);
-              addedCount++;
-            }
           } else {
-            const srcUri = segments.length === 1 ? segments[0] : photo.uri;
-            const cropped = await classifyAndCropBoxesFromPhoto(
+            if (addedCount === 0 && !appendToReviewRef.current) {
+              setImage(photo.uri);
+            }
+            setStatus("review");
+            addedCount += await runBoxStrategyProgressive(
               photo.uri,
               photo.base64,
-              segments.length === 1 ? segments[0] : null,
+              segments,
               "fit_check",
+              setAiMetaList,
             );
-            for (const item of cropped) {
-              setAiMetaList((prev) => [...prev, item]);
-              addedCount++;
-            }
-            if (cropped.length > 0 && i === 0) {
-              setImage(srcUri);
-              setStatus("review");
-            }
           }
         } catch (e) {
           console.warn("[upload] classify failed for captured photo", i + 1, e);
         }
+        setBatchAnalyze({ current: i + 1, total: toProcess.length });
       }
       if (addedCount === 0) {
         if (appendToReviewRef.current) {
@@ -1807,76 +3525,88 @@ export default function AddScreen() {
     }
   };
 
-  /** Upload one image to storage; return its public URL (or null on failure).
-   *  Shrinks item cutouts to max 640px (keeps PNG+alpha) before upload — a
-   *  typical 1024×1280 segmented PNG drops from ~900KB to ~280KB, ~3× faster
-   *  to upload over a phone's cellular. Original (fit-check) photos are
-   *  untouched since they're pre-uploaded separately via the origUrl path.
-   */
-  const uploadImageForCloset = async (imageUri: string): Promise<string | null> => {
-    try {
-      let uploadUri = imageUri;
-      // Resize segmented item PNGs to reduce upload size. We keep PNG to
-      // preserve the transparent background the thumbnail card relies on.
-      try {
-        const manipulated = await ImageManipulator.manipulateAsync(
-          imageUri,
-          [{ resize: { width: 640 } }],
-          { format: ImageManipulator.SaveFormat.PNG, base64: false },
-        );
-        if (manipulated.uri) uploadUri = manipulated.uri;
-      } catch {
-        /* fall through with original uri */
-      }
-      const response = await fetch(uploadUri);
-      const blob = await response.blob();
-      const arrayBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as ArrayBuffer);
-        reader.onerror = reject;
-        reader.readAsArrayBuffer(blob);
-      });
-      const fileName = `piece_${Date.now()}_${Math.random().toString(36).slice(2, 10)}.png`;
-      const { error: storageError } = await supabase.storage
-        .from("clothing-images")
-        .upload(fileName, arrayBuffer, { contentType: "image/png", upsert: true });
-      if (storageError) return null;
-      const {
-        data: { publicUrl },
-      } = supabase.storage.from("clothing-images").getPublicUrl(fileName);
-      return publicUrl;
-    } catch {
-      return null;
-    }
-  };
-
   /** Build the row shape for a single meta entry against an uploaded image URL. */
-  const buildClothingItemRow = (meta: any, imageUrl: string, userId: string) => ({
-    user_id: userId,
-    name: meta?.name || "New Piece",
-    image_url: imageUrl,
-    type: meta?.sub_category || meta?.category || "Piece",
-    category: meta?.category || "other",
-    sub_category: meta?.sub_category || null,
-    color: meta?.color || "Unknown",
-    material: null,
-    fit: null,
-    weight: null,
-    pattern: "solid",
-    style: "casual",
-    seasons: meta?.seasons || warmthToSeasons(meta?.warmth),
-    occasions: meta?.occasions || ["casual"],
-    formality: null,
-    box_2d: meta?.box_2d || null,
-    notes: null,
-    is_digitized: true,
-    image_url_original: meta?.image_url_original ?? null,
-  });
+  const buildClothingItemRow = (
+    meta: any,
+    imageUrl: string,
+    userId: string,
+    thumbnailUrl?: string | null,
+  ) => {
+    const cleanName = americanizeFashionText(String(meta?.name || "New Piece"));
+    const cleanSub = meta?.sub_category
+      ? americanizeFashionText(String(meta.sub_category))
+      : null;
+    const cleanCategory = meta?.category
+      ? americanizeFashionText(String(meta.category))
+      : "other";
+    const cleanType = americanizeFashionText(
+      String(meta?.sub_category || meta?.category || "Piece"),
+    );
+    // Real classifier metadata — these used to be hardcoded ("casual"/"solid"/
+    // null) for every item ever saved, which silently broke style matching.
+    const styleTags = normalizeStyleTags(meta?.style_tags);
+    return {
+      user_id: userId,
+      name: cleanName,
+      image_url: imageUrl,
+      type: cleanType,
+      category: cleanCategory,
+      sub_category: cleanSub,
+      color: meta?.color || "Unknown",
+      material: null,
+      fit: null,
+      weight: null,
+      pattern: normalizePattern(meta?.pattern),
+      style: primaryStyleFromTags(styleTags),
+      style_tags: styleTags.length ? styleTags : null,
+      seasons: normalizedSeasonsForMeta(meta) || warmthToSeasons(meta?.warmth),
+      occasions: meta?.occasions || ["casual"],
+      formality: normalizeFormality(meta?.formality),
+      box_2d: meta?.box_2d || null,
+      notes: null,
+      is_digitized: true,
+      image_url_original: meta?.image_url_original ?? null,
+      image_url_isolated: meta?.image_url_isolated ?? null,
+      thumbnail_url: thumbnailUrl ?? null,
+    };
+  };
 
   const pickImages = async () => {
     setLibraryBanner(null);
     setLibrarySettingsCta(false);
-    const libPerm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    // Snapshot before any `await` — if this changes mid-flight, we still
+    // decide "cancel = leave add-items" from the state when the user opened
+    // the picker (fixes closing the whole flow when dismissing the roll from
+    // the in-session camera, or with items already in review).
+    const fromLibraryMenu =
+      uploadSource === "library" || isLibraryMenuIntent(params.library);
+    const canExitToParentOnPickerCancel =
+      fromLibraryMenu && aiMetaList.length === 0 && !appendToReviewRef.current;
+    const existingItemsSnapshot = appendToReviewRef.current
+      ? [...aiMetaList]
+      : [];
+
+    if (isOutfitMode) {
+      const pickingSession = await persistOutfitUploadSession({
+        userId: uploadUserId,
+        phase: "picking",
+        uploadSource: "library",
+        existingSession: outfitRecoverySessionRef.current,
+      });
+      if (pickingSession) outfitRecoverySessionRef.current = pickingSession;
+    } else {
+      const scanningSession = await persistUploadReviewSession({
+        userId: uploadUserId,
+        aiMetaList: existingItemsSnapshot,
+        sessionStatus: "scanning",
+        uploadSource: "library",
+        linkOutfitId: activeLinkOutfitId,
+        existingSession: recoverySessionRef.current,
+      });
+      if (scanningSession) recoverySessionRef.current = scanningSession;
+    }
+
+    const libPerm = await requestLibraryAccessWithPriming();
     if (!libPerm.granted) {
       const msg =
         "Allow photo library access to pick images. You can enable it in Settings if you previously denied access.";
@@ -1889,12 +3619,11 @@ export default function AddScreen() {
       return;
     }
 
-    const fromLibraryMenu = uploadSource === "library";
     if (fromLibraryMenu) setLibraryPickerOpen(true);
     let res: Awaited<ReturnType<typeof ImagePicker.launchImageLibraryAsync>>;
     try {
       res = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ["images"],
         allowsMultipleSelection: true,
         selectionLimit: MAX_LIBRARY_PHOTOS,
         orderedSelection: true,
@@ -1908,45 +3637,103 @@ export default function AddScreen() {
             }
           : {}),
       });
+    } catch (e) {
+      console.error("[upload] launchImageLibraryAsync failed", e);
+      Alert.alert("Could not open photos", formatUnknownError(e));
+      setStatus("scanning");
+      return;
     } finally {
       if (fromLibraryMenu) setLibraryPickerOpen(false);
     }
 
     if (res.canceled || res.assets.length === 0) {
-      if (fromLibraryMenu) router.back();
+      if (canExitToParentOnPickerCancel) {
+        if (isOutfitMode) {
+          await clearOutfitUploadRecoverySession(uploadUserId);
+        } else {
+          await clearUploadRecoverySession(uploadUserId);
+        }
+        router.back();
+      }
       return;
     }
 
-    // Immediately trigger UI loading state so the user doesn't see a hung white screen
-    // while the HEIC -> JPEG transcoder bridges to native and blocks.
+    const assetUris = res.assets.map((a) => a.uri);
+
     setUploadSource("library");
-    setStatus("analyzing");
-    setBatchAnalyze({ current: 0, total: res.assets.length });
-    setImage(res.assets[0].uri);
+
+    if (isOutfitMode) {
+      // Flip to the processing screen immediately. Persisting the recovery
+      // session copies every selected photo to disk (several seconds for a
+      // multi-photo batch), so awaiting it here would leave the user staring
+      // at the live camera the whole time. Show the loader first, then persist.
+      setStatus("outfit_processing");
+      setBatchAnalyze({ current: 0, total: res.assets.length });
+      setImage(null);
+
+      const processingSession = await persistOutfitUploadSession({
+        userId: uploadUserId,
+        phase: "processing",
+        uploadSource: "library",
+        pendingUris: assetUris,
+        existingSession: outfitRecoverySessionRef.current,
+      });
+      if (processingSession) {
+        outfitRecoverySessionRef.current = processingSession;
+      }
+    } else {
+      const queuedSession = await persistUploadReviewSession({
+        userId: uploadUserId,
+        aiMetaList: existingItemsSnapshot,
+        imageUri: assetUris[0],
+        pendingPhotoUris: assetUris,
+        uploadSource: "library",
+        sessionStatus: "queued",
+        linkOutfitId: activeLinkOutfitId,
+        existingSession: recoverySessionRef.current,
+      });
+      if (queuedSession) recoverySessionRef.current = queuedSession;
+
+      // UI after durable save — crash during transcode still recovers photos.
+      setStatus("review");
+      setBatchAnalyze({ current: 0, total: res.assets.length });
+      setImage(assetUris[0] ?? null);
+    }
 
     // Defer the heavy transcoding to fully yield the thread so the UI can flush the loading view.
     // 50ms is plenty — one frame + buffer — vs 400ms which was producing a visible lag.
     setTimeout(async () => {
-      // Transcode in parallel — HEIC→JPEG is independent per asset and previously serial.
-      const jpegUris = await Promise.all(
-        res.assets.map(async (a) => {
-          try {
-            return await ensureJpegUri(a.uri);
-          } catch (e) {
-            console.warn("[upload] JPEG transcode failed, using picker URI", e);
-            return a.uri;
-          }
-        }),
-      );
+      // Safety net: this runs detached (setTimeout), so an unexpected throw
+      // here would otherwise be swallowed and leave the review stuck on the
+      // loading bar. Surface it and reset to a usable state instead.
+      try {
+        // Transcode in parallel — HEIC→JPEG is independent per asset and previously serial.
+        const jpegUris = await Promise.all(
+          res.assets.map(async (a) => {
+            try {
+              return await ensureJpegUri(a.uri);
+            } catch (e) {
+              console.warn("[upload] JPEG transcode failed, using picker URI", e);
+              return a.uri;
+            }
+          }),
+        );
 
-      await analyzeAllLibraryPhotos(jpegUris);
+        await analyzeAllLibraryPhotos(jpegUris);
+      } catch (e) {
+        console.error("[upload] library analyze crashed", e);
+        setBatchAnalyze(null);
+        setAiMetaList([]);
+        setStatus("scanning");
+        Alert.alert("Upload failed", formatUnknownError(e));
+      }
     }, 50);
   };
 
   /** Pick photos from library and APPEND results to existing review list */
   const addMoreFromLibrary = async () => {
     setAddMoreSheetOpen(false);
-    appendToReviewRef.current = false;
+    appendToReviewRef.current = true;
     if (status === "done") {
       setStatus("review");
       if (!image) {
@@ -1954,7 +3741,7 @@ export default function AddScreen() {
         if (u) setImage(u);
       }
     }
-    const libPerm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    const libPerm = await requestLibraryAccessWithPriming();
     if (!libPerm.granted) {
       Alert.alert("Photo library access needed", "Enable it in Settings.", [
         { text: "Cancel", style: "cancel" },
@@ -1962,10 +3749,21 @@ export default function AddScreen() {
       ]);
       return;
     }
+
+    const scanningSession = await persistUploadReviewSession({
+      userId: uploadUserId,
+      aiMetaList: [...aiMetaList],
+      sessionStatus: "scanning",
+      uploadSource: "library",
+      linkOutfitId: activeLinkOutfitId,
+      existingSession: recoverySessionRef.current,
+    });
+    if (scanningSession) recoverySessionRef.current = scanningSession;
+
     let res: Awaited<ReturnType<typeof ImagePicker.launchImageLibraryAsync>>;
     try {
       res = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ["images"],
         allowsMultipleSelection: true,
         selectionLimit: MAX_LIBRARY_PHOTOS,
         orderedSelection: true,
@@ -1984,11 +3782,26 @@ export default function AddScreen() {
     }
     if (res.canceled || res.assets.length === 0) return;
 
-    // Immediately trigger UI loading state
+    const assetUris = res.assets.map((a) => a.uri);
+
+    const appendSession = await persistUploadReviewSession({
+      userId: uploadUserId,
+      aiMetaList: [...aiMetaList],
+      imageUri: assetUris[0] ?? image,
+      pendingPhotoUris: assetUris,
+      uploadSource: "library",
+      sessionStatus: "queued",
+      linkOutfitId: activeLinkOutfitId,
+      existingSession: recoverySessionRef.current,
+    });
+    if (appendSession) recoverySessionRef.current = appendSession;
+
     setUploadSource("library");
-    setStatus("analyzing");
+    setStatus("review");
     setBatchAnalyze({ current: 0, total: res.assets.length });
-    setImage(res.assets[0].uri);
+    setImage(assetUris[0] ?? null);
+    pinReviewScrollToAppendRef.current = true;
+    scrollReviewToEnd(false);
 
     setTimeout(async () => {
       const jpegUris: string[] = [];
@@ -2003,86 +3816,37 @@ export default function AddScreen() {
       // Analyze and append — don't clear existing items
       setBatchAnalyze({ current: 0, total: jpegUris.length });
       for (let i = 0; i < jpegUris.length; i++) {
-        setBatchAnalyze({ current: i + 1, total: jpegUris.length });
         const uri = jpegUris[i];
         try {
           const b64 = await uriToBase64(uri);
           const segments = await segmentItems(b64);
           const strategy = await decideUploadSegmentStrategy(segments, uri);
           if (strategy === "per_segment") {
-            setAiMetaList((prev) => [
-              ...prev,
-              ...segments.map((seg) => ({
-                sourceUri: seg,
-                isIsolated: true,
-                _classifying: true,
-                name: "",
-              })),
-            ]);
-            await Promise.all(
-              segments.map(async (seg, si) => {
-                try {
-                  const segB64 = await resizeForVision(seg);
-                  const result = await apiClient.classify(
-                    segB64,
-                    "auto",
-                    "single",
-                    undefined,
-                    true,
-                  );
-                  const meta = Array.isArray(result.metadata)
-                    ? result.metadata[0]
-                    : result.metadata;
-                  if (meta && typeof meta === "object") {
-                    setAiMetaList((prev) => {
-                      const idx = prev.findIndex(
-                        (p) => p.sourceUri === seg && p._classifying,
-                      );
-                      if (idx === -1) return prev;
-                      const next = [...prev];
-                      next[idx] = { ...meta, sourceUri: seg, isIsolated: true };
-                      return next;
-                    });
-                  }
-                } catch (e) {
-                  setAiMetaList((prev) =>
-                    prev.filter((p) => !(p.sourceUri === seg && p._classifying)),
-                  );
-                  console.warn("[upload] classify failed for segment", si, e);
-                }
-              }),
-            );
-            setAiMetaList((prev) =>
-              mergeShoeIsolatesForSegmentBatch(prev, segments),
-            );
+            setStatus("review");
+            await runPerSegmentClassifyProgressive(uri, segments, setAiMetaList);
           } else if (strategy === "flat_lay_boxes") {
-            let cropped = await classifyAndCropBoxesFromPhoto(
+            setStatus("review");
+            await runBoxStrategyProgressive(
               uri,
               b64,
-              null,
+              segments,
               "flat_lay",
+              setAiMetaList,
             );
-            if (cropped.length === 0 && segments.length === 1 && segments[0]) {
-              const fb = await fallbackClassifySingleCutout(segments[0], uri);
-              cropped = fb ? [fb] : [];
-            }
-            for (const item of cropped) {
-              setAiMetaList((prev) => [...prev, item]);
-            }
           } else {
-            const cropped = await classifyAndCropBoxesFromPhoto(
+            setStatus("review");
+            await runBoxStrategyProgressive(
               uri,
               b64,
-              segments.length === 1 ? segments[0] : null,
+              segments,
               "fit_check",
+              setAiMetaList,
             );
-            for (const item of cropped) {
-              setAiMetaList((prev) => [...prev, item]);
-            }
           }
         } catch (e) {
           console.warn("[upload] addMore failed for photo", i + 1, e);
         }
+        setBatchAnalyze({ current: i + 1, total: jpegUris.length });
       }
       setBatchAnalyze(null);
     }, 400);
@@ -2097,21 +3861,629 @@ export default function AddScreen() {
     setCapturedPhotos([]);
   };
 
+  const closeCamera = () => {
+    if (appendToReviewRef.current && aiMetaList.length > 0) {
+      appendToReviewRef.current = false;
+      setCapturedPhotos([]);
+      setBatchAnalyze(null);
+      setStatus("review");
+      return;
+    }
+    if (isOutfitMode && !isExtractForOutfitMode && !appendToReviewRef.current) {
+      const hasWork =
+        outfitDraftsRef.current.length > 0 ||
+        capturedPhotos.length > 0 ||
+        status === "outfit_processing";
+      if (hasWork) {
+        handleOutfitLeaveRef.current();
+        return;
+      }
+    }
+    void clearUploadRecoverySession(uploadUserId);
+    void clearOutfitUploadRecoverySession(uploadUserId);
+    recoverySessionRef.current = null;
+    outfitRecoverySessionRef.current = null;
+    router.back();
+  };
+
+  const outfitRestoreHandledRef = useRef(false);
+  const uploadIntentSavedRef = useRef(false);
+
+  const persistItemsUploadIntent = useCallback(
+    async (source: "camera" | "library") => {
+      if (isOutfitMode || isExtractForOutfitMode) return;
+      const session = await persistUploadReviewSession({
+        userId: uploadUserId,
+        aiMetaList: appendToReviewRef.current ? [...aiMetaList] : [],
+        sessionStatus: "scanning",
+        uploadSource: source,
+        linkOutfitId: activeLinkOutfitId,
+        existingSession: recoverySessionRef.current,
+      });
+      if (session) recoverySessionRef.current = session;
+    },
+    [
+      activeLinkOutfitId,
+      aiMetaList,
+      isExtractForOutfitMode,
+      isOutfitMode,
+      uploadUserId,
+    ],
+  );
+
+  const persistOutfitUploadIntent = useCallback(
+    async (source: "camera" | "library") => {
+      if (!isOutfitMode || isExtractForOutfitMode) return;
+      const session = await persistOutfitUploadSession({
+        userId: uploadUserId,
+        phase: "picking",
+        uploadSource: source,
+        existingSession: outfitRecoverySessionRef.current,
+      });
+      if (session) outfitRecoverySessionRef.current = session;
+    },
+    [isExtractForOutfitMode, isOutfitMode, uploadUserId],
+  );
+
   pickImagesRef.current = pickImages;
 
   useEffect(() => {
-    if (!isLibraryMenuIntent(params.library)) return;
+    if (!isLibraryMenuIntent(params.library) || restoreOutfitParam) return;
+    setUploadSource("library");
     setStatus("scanning");
     setImage(null);
     setAiMetaList([]);
     setCapturedPhotos([]);
     setLibraryAutoPickPending(true);
+    void (async () => {
+      if (isOutfitMode) {
+        await persistOutfitUploadIntent("library");
+      } else {
+        await persistItemsUploadIntent("library");
+      }
+    })();
     const timer = setTimeout(() => {
       pickImagesRef.current().finally(() => setLibraryAutoPickPending(false));
-    }, 50);
+    }, 450);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.library]);
+
+  useEffect(() => {
+    if (isExtractForOutfitMode || restoreUploadParam || restoreOutfitParam) return;
+    if (uploadIntentSavedRef.current) return;
+    if (isLibraryMenuIntent(params.library)) return;
+    uploadIntentSavedRef.current = true;
+    void (async () => {
+      if (isOutfitMode) {
+        await persistOutfitUploadIntent(uploadSource);
+      } else {
+        await persistItemsUploadIntent(uploadSource);
+      }
+    })();
+  }, [
+    isExtractForOutfitMode,
+    isOutfitMode,
+    params.library,
+    persistItemsUploadIntent,
+    persistOutfitUploadIntent,
+    restoreOutfitParam,
+    restoreUploadParam,
+    uploadSource,
+  ]);
+
+  useEffect(() => {
+    if (!isExtractForOutfitMode || !outfitImageUrlParam || extractBootstrappedRef.current) {
+      return;
+    }
+    extractBootstrappedRef.current = true;
+    void (async () => {
+      try {
+        let localUri = outfitImageUrlParam;
+        if (outfitImageUrlParam.startsWith("http")) {
+          localUri = await downloadImageToCache(outfitImageUrlParam);
+        }
+        setImage(localUri);
+        setStatus("analyzing");
+        const b64 = await uriToBase64(localUri);
+        const found = await processImage(b64, localUri);
+        // Nothing detected — don't strand the user on the extraction spinner
+        // (aiMetaList stays empty, so the loading guard would render forever).
+        // Tell them plainly and return to where they came from.
+        if (found === 0) {
+          Alert.alert(
+            "No items found",
+            "We couldn't pull any clothing pieces out of that photo. Try a clearer, well-lit shot of the full outfit.",
+          );
+          router.back();
+        }
+      } catch (e) {
+        console.error("[extract-for-outfit]", e);
+        Alert.alert("Extraction failed", formatUnknownError(e));
+        router.back();
+      }
+    })();
+  }, [isExtractForOutfitMode, outfitImageUrlParam, router]);
+
+  const resolveUploadSessionStatus = useCallback((): UploadRecoverySession["status"] => {
+    if (uploading) return "uploading";
+    if (status === "analyzing") return "analyzing";
+    if (
+      recoverySessionRef.current?.status === "partial" ||
+      recoverySessionRef.current?.status === "uploading"
+    ) {
+      return recoverySessionRef.current.status;
+    }
+    return aiMetaList.length > 0 ? "reviewing" : "analyzing";
+  }, [aiMetaList.length, status, uploading]);
+
+  const flushUploadSession = useCallback(async () => {
+    if (isOutfitMode || isExtractForOutfitMode || uploading) return;
+
+    if (status === "scanning") {
+      const session = await persistUploadReviewSession({
+        userId: uploadUserId,
+        aiMetaList: appendToReviewRef.current ? [...aiMetaList] : [],
+        sessionStatus: "scanning",
+        uploadSource,
+        linkOutfitId: activeLinkOutfitId,
+        existingSession: recoverySessionRef.current,
+      });
+      if (session) recoverySessionRef.current = session;
+      return;
+    }
+
+    if (aiMetaList.length === 0 && !image) return;
+
+    const session = await persistUploadReviewSession({
+      userId: uploadUserId,
+      aiMetaList,
+      imageUri: image,
+      linkOutfitId: activeLinkOutfitId,
+      existingSession: recoverySessionRef.current,
+      sessionStatus: resolveUploadSessionStatus(),
+      pendingPhotoUris: aiMetaList.length > 0 ? null : undefined,
+      uploadSource,
+    });
+    if (session) recoverySessionRef.current = session;
+  }, [
+    activeLinkOutfitId,
+    aiMetaList,
+    image,
+    isExtractForOutfitMode,
+    isOutfitMode,
+    resolveUploadSessionStatus,
+    uploadUserId,
+    uploading,
+    uploadSource,
+    status,
+  ]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    void migrateUploadRecoverySession(UPLOAD_RECOVERY_LOCAL_USER, user.id);
+    void migrateOutfitUploadRecoverySession(
+      UPLOAD_RECOVERY_LOCAL_USER,
+      user.id,
+    );
+  }, [user?.id]);
+
+  const flushOutfitUploadSession = useCallback(async () => {
+    if (!isOutfitMode || isExtractForOutfitMode || savingOutfitPhoto) return;
+
+    if (
+      status === "outfit_review" &&
+      outfitDraftsRef.current.length > 0
+    ) {
+      await persistOutfitDraftsToSession(
+        outfitDraftsRef.current,
+        "review",
+      );
+      return;
+    }
+
+    if (status === "outfit_processing" || status === "outfit_isolating") {
+      return;
+    }
+
+    if (status === "scanning") {
+      const session = await persistOutfitUploadSession({
+        userId: uploadUserId,
+        phase: "picking",
+        uploadSource,
+        existingSession: outfitRecoverySessionRef.current,
+      });
+      if (session) outfitRecoverySessionRef.current = session;
+    }
+  }, [
+    isExtractForOutfitMode,
+    isOutfitMode,
+    persistOutfitDraftsToSession,
+    savingOutfitPhoto,
+    status,
+    uploadSource,
+    uploadUserId,
+  ]);
+
+  const applyOutfitRecoverySession = useCallback(
+    async (opts?: { showMissingAlert?: boolean }) => {
+      if (!isOutfitMode || isExtractForOutfitMode || savingOutfitPhoto) {
+        return false;
+      }
+      if (
+        status === "outfit_review" &&
+        outfitDraftsRef.current.length > 0
+      ) {
+        return false;
+      }
+
+      await ensureRecoveryDeclinesLoaded(uploadUserId);
+
+      let session =
+        (await loadOutfitUploadRecoverySession(uploadUserId)) ??
+        (user?.id
+          ? await loadOutfitUploadRecoverySession(UPLOAD_RECOVERY_LOCAL_USER)
+          : null);
+      if (!session || isOutfitUploadRecoveryDismissed(session.id)) return false;
+
+      const validated = await validateOutfitUploadRecoverySession(session);
+      if (!validated) {
+        await clearOutfitUploadRecoverySession(session.userId);
+        if (opts?.showMissingAlert) {
+          Alert.alert(
+            "Nothing to restore",
+            "The saved photos for that outfit are no longer on this device.",
+          );
+        }
+        return false;
+      }
+      session = validated;
+      outfitRecoverySessionRef.current = session;
+      setUploadSource(session.uploadSource);
+
+      if (session.phase === "picking") {
+        setStatus("scanning");
+        if (session.uploadSource === "library") {
+          await pickImagesRef.current();
+        }
+        return true;
+      }
+
+      if (session.drafts && session.drafts.length > 0) {
+        syncOutfitDrafts(
+          session.drafts.map((d) => ({
+            id: d.id,
+            heroUri: d.heroUri,
+            originalUri: d.originalUri,
+            name: d.name ?? "",
+            schedule: d.schedule ?? "none",
+            pickIso: d.pickIso ?? null,
+          })),
+        );
+        setStatus("outfit_review");
+        return true;
+      }
+
+      if (session.phase === "review" && session.imageUri) {
+        syncOutfitDrafts([
+          {
+            id: newOutfitDraftId(),
+            heroUri: session.imageUri,
+            originalUri: session.originalUri ?? session.imageUri,
+            name: session.outfitName ?? "",
+            schedule: session.outfitSchedule ?? "none",
+            pickIso: session.outfitPickIso ?? null,
+          },
+        ]);
+        setStatus("outfit_review");
+        return true;
+      }
+
+      const allUris = session.originalUri
+        ? [
+            session.originalUri,
+            ...session.pendingUris.filter((u) => u !== session.originalUri),
+          ]
+        : [...session.pendingUris];
+      if (allUris.length === 0) return false;
+
+      const jpegUris = await Promise.all(
+        allUris.map((uri) => ensureJpegUri(uri)),
+      );
+      await prepareOutfitDraftBatch(jpegUris);
+      return true;
+    },
+    [
+      isExtractForOutfitMode,
+      isOutfitMode,
+      prepareOutfitDraftBatch,
+      savingOutfitPhoto,
+      status,
+      syncOutfitDrafts,
+      uploadUserId,
+      user?.id,
+    ],
+  );
+
+  useEffect(() => {
+    if (!isOutfitMode || isExtractForOutfitMode) return;
+    if (outfitRestoreHandledRef.current) return;
+    outfitRestoreHandledRef.current = true;
+
+    void (async () => {
+      const restored = await applyOutfitRecoverySession({
+        showMissingAlert: restoreOutfitParam,
+      });
+      if (restoreOutfitParam && !restored) {
+        const session = await loadOutfitUploadRecoverySession(uploadUserId);
+        if (!session) {
+          Alert.alert(
+            "Nothing to restore",
+            "Your last outfit session is no longer available.",
+          );
+        }
+      }
+    })();
+  }, [
+    applyOutfitRecoverySession,
+    isExtractForOutfitMode,
+    isOutfitMode,
+    restoreOutfitParam,
+    uploadUserId,
+  ]);
+
+  useEffect(() => {
+    if (!isOutfitMode || isExtractForOutfitMode) return;
+    const sub = AppState.addEventListener("change", (next) => {
+      if (next === "active") {
+        void applyOutfitRecoverySession();
+      } else if (next === "background" || next === "inactive") {
+        void flushOutfitUploadSession();
+      }
+    });
+    return () => sub.remove();
+  }, [
+    applyOutfitRecoverySession,
+    flushOutfitUploadSession,
+    isExtractForOutfitMode,
+    isOutfitMode,
+  ]);
+
+  useEffect(() => {
+    if (!isOutfitMode || isExtractForOutfitMode || !image) return;
+    if (status !== "analyzing" && status !== "scanning") return;
+    void flushOutfitUploadSession();
+  }, [
+    flushOutfitUploadSession,
+    image,
+    isExtractForOutfitMode,
+    isOutfitMode,
+    status,
+  ]);
+
+  useEffect(() => {
+    if (!isOutfitMode || isExtractForOutfitMode) return;
+    if (status !== "scanning") return;
+    void flushOutfitUploadSession();
+  }, [flushOutfitUploadSession, isExtractForOutfitMode, isOutfitMode, status]);
+
+  useEffect(() => {
+    if (!isOutfitMode || status !== "outfit_review") return;
+    if (outfitPersistTimerRef.current) {
+      clearTimeout(outfitPersistTimerRef.current);
+    }
+    outfitPersistTimerRef.current = setTimeout(() => {
+      void persistOutfitDraftsToSession(outfitDraftsRef.current, "review");
+    }, 400);
+    return () => {
+      if (outfitPersistTimerRef.current) {
+        clearTimeout(outfitPersistTimerRef.current);
+      }
+    };
+  }, [
+    isOutfitMode,
+    outfitDrafts,
+    persistOutfitDraftsToSession,
+    status,
+  ]);
+
+  const applyUploadRecoverySession = useCallback(
+    async (opts?: { showMissingAlert?: boolean; showResumeHint?: boolean }) => {
+      if (isOutfitMode || isExtractForOutfitMode || uploading) return false;
+      if (aiMetaList.length > 0 || status === "review") return false;
+
+      await ensureRecoveryDeclinesLoaded(uploadUserId);
+
+      let session =
+        (await loadUploadRecoverySession(uploadUserId)) ??
+        (user?.id
+          ? await loadUploadRecoverySession(UPLOAD_RECOVERY_LOCAL_USER)
+          : null);
+      if (!session || isItemsRecoveryDismissed(session.id)) return false;
+
+      session = await validateUploadRecoverySession(session);
+      if (sessionPendingCount(session) === 0) {
+        await clearUploadRecoverySession(session.userId);
+        if (opts?.showMissingAlert) {
+          Alert.alert(
+            "Nothing to restore",
+            "The saved images for that upload are no longer on this device.",
+          );
+        }
+        return false;
+      }
+
+      recoverySessionRef.current = session;
+      const restored = sessionToAiMetaList(session);
+      const resumeSaving =
+        session.status === "uploading" || session.status === "partial";
+
+      if (
+        session.status === "scanning" &&
+        (session.pendingPhotoUris?.length ?? 0) === 0
+      ) {
+        setUploadSource(session.uploadSource ?? "library");
+        setStatus("scanning");
+        if (session.uploadSource === "library") {
+          await pickImagesRef.current();
+        } else {
+          setUploadSource("camera");
+        }
+        return true;
+      }
+
+      const queuedPhotos = session.pendingPhotoUris ?? [];
+      const resumeQueuedScan = queuedPhotos.length > 0;
+
+      if (restored.length > 0) {
+        setAiMetaList(restored);
+        const firstSourceUri =
+          typeof restored[0]?.sourceUri === "string"
+            ? restored[0].sourceUri
+            : null;
+        setUploadSource(session.uploadSource ?? "library");
+        setImage(session.imageUri ?? firstSourceUri);
+        if (!resumeQueuedScan) {
+          setStatus("review");
+          if (resumeSaving && opts?.showResumeHint) {
+            Alert.alert(
+              "Ready to resume",
+              "Tap Save to finish adding the remaining items.",
+            );
+          }
+          return true;
+        }
+        setStatus("review");
+      }
+
+      if (resumeQueuedScan) {
+        appendToReviewRef.current = restored.length > 0;
+        setUploadSource(session.uploadSource ?? "library");
+        setStatus("review");
+        setBatchAnalyze({ current: 0, total: queuedPhotos.length });
+        if (!image) setImage(queuedPhotos[0] ?? null);
+        try {
+          const jpegUris = await Promise.all(
+            queuedPhotos.map((uri) => ensureJpegUri(uri)),
+          );
+          await analyzeAllLibraryPhotos(jpegUris);
+          return true;
+        } catch (e) {
+          console.error("[upload-restore-queue]", e);
+          Alert.alert(
+            "Could not resume",
+            "We found your photos but could not re-run analysis. Try uploading again.",
+          );
+        }
+        return false;
+      }
+
+      if (session.imageUri) {
+        setUploadSource("library");
+        setImage(session.imageUri);
+        setStatus("review");
+        try {
+          const b64 = await uriToBase64(session.imageUri);
+          await processImage(b64, session.imageUri);
+          return true;
+        } catch (e) {
+          console.error("[upload-restore]", e);
+          setStatus("review");
+          Alert.alert(
+            "Could not resume",
+            "We found your photo but could not re-run analysis. Try uploading again.",
+          );
+        }
+      }
+
+      return false;
+    },
+    [
+      aiMetaList.length,
+      isExtractForOutfitMode,
+      isOutfitMode,
+      status,
+      uploadUserId,
+      uploading,
+      user?.id,
+    ],
+  );
+
+  useEffect(() => {
+    if (isOutfitMode || isExtractForOutfitMode) return;
+    if (uploadRestoreHandledRef.current) return;
+    uploadRestoreHandledRef.current = true;
+
+    void (async () => {
+      const restored = await applyUploadRecoverySession({
+        showMissingAlert: restoreUploadParam,
+        showResumeHint: restoreUploadParam,
+      });
+      if (restoreUploadParam && !restored) {
+        const session = await loadUploadRecoverySession(uploadUserId);
+        if (!session) {
+          Alert.alert(
+            "Nothing to restore",
+            "Your last upload session is no longer available.",
+          );
+        }
+      }
+    })();
+  }, [
+    applyUploadRecoverySession,
+    isExtractForOutfitMode,
+    isOutfitMode,
+    restoreUploadParam,
+    uploadUserId,
+  ]);
+
+  useEffect(() => {
+    if (isOutfitMode || isExtractForOutfitMode) return;
+    const sub = AppState.addEventListener("change", (next) => {
+      if (next === "active") {
+        void applyUploadRecoverySession();
+      }
+    });
+    return () => sub.remove();
+  }, [applyUploadRecoverySession, isExtractForOutfitMode, isOutfitMode]);
+
+  useEffect(() => {
+    if (isOutfitMode || isExtractForOutfitMode) return;
+    if (status !== "scanning") return;
+    void flushUploadSession();
+  }, [flushUploadSession, isExtractForOutfitMode, isOutfitMode, status]);
+
+  useEffect(() => {
+    if (isOutfitMode || isExtractForOutfitMode) return;
+    if (aiMetaList.length === 0 && !image) return;
+
+    if (persistReviewTimerRef.current) {
+      clearTimeout(persistReviewTimerRef.current);
+    }
+    persistReviewTimerRef.current = setTimeout(() => {
+      void flushUploadSession();
+    }, 350);
+
+    return () => {
+      if (persistReviewTimerRef.current) {
+        clearTimeout(persistReviewTimerRef.current);
+      }
+    };
+  }, [
+    aiMetaList,
+    flushUploadSession,
+    image,
+    isExtractForOutfitMode,
+    isOutfitMode,
+  ]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next) => {
+      if (next !== "background" && next !== "inactive") return;
+      void flushUploadSession();
+    });
+    return () => sub.remove();
+  }, [flushUploadSession]);
 
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener("openLibraryPicker", () => {
@@ -2141,98 +4513,116 @@ export default function AddScreen() {
       Alert.alert("Sign in", "Sign in to save to your closet.");
       return;
     }
-    setUploading(true);
-    try {
-      // Pre-upload original images for enhanced items so we have a stable URL.
-      // Runs in parallel — each original is an independent upload, so serial
-      // `for…await` was adding N roundtrips of latency for no reason.
-      const uniqueOrigUris = Array.from(
-        new Set(
-          aiMetaList
-            .map((r) => r.originalSourceUri)
-            .filter((u): u is string => !!u),
-        ),
-      );
-      const origUrlPairs = await Promise.all(
-        uniqueOrigUris.map(async (origUri) => {
-          try {
-            const resp = await fetch(origUri);
-            const blob = await resp.blob();
-            const buf = await new Promise<ArrayBuffer>((res, rej) => {
-              const r = new FileReader();
-              r.onload = () => res(r.result as ArrayBuffer);
-              r.onerror = rej;
-              r.readAsArrayBuffer(blob);
-            });
-            const fn = `orig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`;
-            const { error: e } = await supabase.storage
-              .from("clothing-images")
-              .upload(fn, buf, { contentType: "image/jpeg", upsert: true });
-            if (e) return null;
-            const {
-              data: { publicUrl },
-            } = supabase.storage.from("clothing-images").getPublicUrl(fn);
-            return [origUri, publicUrl] as const;
-          } catch {
-            return null;
-          }
-        }),
-      );
-      const origUrlMap = new Map<string, string>(
-        origUrlPairs.filter((p): p is readonly [string, string] => p !== null),
-      );
+    if (!(await confirmLowConfidenceItems(aiMetaList))) return;
+    const itemsSnapshot = [...aiMetaList];
+    const imageSnapshot = image;
 
-      const byUri = new Map<string, any[]>();
-      for (const raw of aiMetaList) {
-        const uri = raw.sourceUri ?? image;
-        if (!uri) continue;
-        const { sourceUri: _s, originalSourceUri: _o, ...meta } = raw;
-        const origUri = raw.originalSourceUri;
-        const image_url_original = origUri
-          ? (origUrlMap.get(origUri) ?? null)
-          : null;
-        if (!byUri.has(uri)) byUri.set(uri, []);
-        byUri.get(uri)!.push({ ...meta, image_url_original });
-      }
-      const entries = [...byUri.entries()].filter(
-        ([, metas]) => metas.length > 0,
-      );
-      if (entries.length === 0) {
-        Alert.alert("Save error", "Missing image data for these items.");
-        return;
-      }
-      // Upload all per-item images in parallel (chunked at 10 to avoid storage
-      // overload), then do ONE batch DB insert for every row at the end.
-      // Previously this was N interleaved upload+insert roundtrips.
-      const UPLOAD_CONCURRENCY = 10;
-      const uriToPublicUrl = new Map<string, string>();
-      for (let i = 0; i < entries.length; i += UPLOAD_CONCURRENCY) {
-        const slice = entries.slice(i, i + UPLOAD_CONCURRENCY);
-        const urls = await Promise.all(
-          slice.map(([uri]) => uploadImageForCloset(uri)),
-        );
-        slice.forEach(([uri], j) => {
-          const u = urls[j];
-          if (u) uriToPublicUrl.set(uri, u);
-        });
-      }
-      const allRows = entries.flatMap(([uri, metas]) => {
-        const publicUrl = uriToPublicUrl.get(uri);
-        if (!publicUrl) return [];
-        return metas.map((m) => buildClothingItemRow(m, publicUrl, userId));
+    if (persistReviewTimerRef.current) {
+      clearTimeout(persistReviewTimerRef.current);
+      persistReviewTimerRef.current = null;
+    }
+
+    setUploading(true);
+
+    try {
+      const session = await persistUploadReviewSession({
+        userId,
+        aiMetaList: itemsSnapshot,
+        imageUri: imageSnapshot,
+        linkOutfitId: activeLinkOutfitId,
+        existingSession: recoverySessionRef.current,
       });
-      if (allRows.length === 0) {
-        Alert.alert("Save error", "All uploads failed.");
+
+      if (!session) {
+        Alert.alert("Save error", "Could not prepare your upload session.");
+        setUploading(false);
         return;
       }
-      const { error: insertError } = await supabase
-        .from("clothing_items")
-        .insert(allRows);
-      if (insertError) throw insertError;
-      setStatus("done");
+
+      recoverySessionRef.current = session;
+
+      const { session: updatedSession, insertedIds, allSaved } =
+        await saveUploadSessionToCloset(
+          session,
+          supabase,
+          userId,
+          buildClothingItemRow,
+        );
+
+      recoverySessionRef.current = updatedSession;
+
+      if (insertedIds.length === 0) {
+        Alert.alert(
+          "Save error",
+          "All uploads failed. Open Upload again to retry.",
+        );
+        setUploading(false);
+        return;
+      }
+
+      const wardrobeId = takeAddItemsWardrobeId();
+      if (wardrobeId && insertedIds.length) {
+        await addItemsToWardrobe(wardrobeId, insertedIds);
+      } else if (insertedIds.length) {
+        void fetchWardrobes(userId)
+          .then((existingWardrobes) => {
+            if (existingWardrobes.length === 0) {
+              return markPendingFirstWardrobePrompt(userId);
+            }
+          })
+          .catch(() => {});
+      }
+
+      if (activeLinkOutfitId && insertedIds.length) {
+        await attachClothingItemsToOutfit(
+          supabase,
+          activeLinkOutfitId,
+          insertedIds,
+        );
+        DeviceEventEmitter.emit("closetItemsSaved");
+        DeviceEventEmitter.emit("outfitItemsExtracted", {
+          outfitId: activeLinkOutfitId,
+          itemIds: insertedIds,
+        });
+        if (allSaved) {
+          await clearUploadRecoverySession(userId);
+          recoverySessionRef.current = null;
+        }
+        setUploading(false);
+        setPendingLinkOutfitId(null);
+        if (allSaved) {
+          router.replace(fitsLibraryRoute({ openFitId: activeLinkOutfitId }) as any);
+        } else {
+          const remaining = sessionPendingCount(updatedSession);
+          setAiMetaList(sessionToAiMetaList(updatedSession));
+          Alert.alert(
+            "Partially saved",
+            `${insertedIds.length} saved, ${remaining} still waiting. Tap save again or come back later.`,
+          );
+        }
+        return;
+      }
+
+      DeviceEventEmitter.emit("closetItemsSaved");
+
+      if (allSaved) {
+        await clearUploadRecoverySession(userId);
+        recoverySessionRef.current = null;
+        leaveAddItemsFlow();
+      } else {
+        const remaining = sessionPendingCount(updatedSession);
+        setAiMetaList(sessionToAiMetaList(updatedSession));
+        Alert.alert(
+          "Partially saved",
+          `${insertedIds.length} saved, ${remaining} still waiting. Tap save again or come back later.`,
+        );
+      }
     } catch (err) {
       console.error("Upload Error:", err);
-      Alert.alert("Archive Failed", "Could not sync items to database.");
+      Alert.alert(
+        "Archive Failed",
+        "Could not sync items to database. Open Upload again to resume.",
+      );
     } finally {
       setUploading(false);
     }
@@ -2242,47 +4632,76 @@ export default function AddScreen() {
     setAiMetaList((prev) => prev.filter((_, i) => i !== index));
   };
 
-  const enhanceItemAtIndex = async (idx: number) => {
-    const item = aiMetaList[idx];
+  const syncOutfitExtractItemsFromAiMeta = (
+    draftId: string,
+    items: Record<string, unknown>[],
+  ) => {
+    syncOutfitDrafts(
+      outfitDraftsRef.current.map((d) =>
+        d.id === draftId
+          ? { ...d, extractItems: items.map((it) => ({ ...it })) }
+          : d,
+      ),
+    );
+  };
+
+  const enhanceItemAtIndex = async (idx: number, extractDraftId?: string) => {
+    const draftItems = extractDraftId
+      ? outfitDraftsRef.current.find((d) => d.id === extractDraftId)
+          ?.extractItems
+      : null;
+    const item = draftItems?.[idx] ?? aiMetaList[idx];
     if (!item || item._classifying || item._enhancing) return;
-    // Always enhance from the pristine original, not from a previously enhanced output.
-    const src = item.originalSourceUri ?? item.sourceUri;
+    const src = item.sourceUri ?? item.originalSourceUri;
     if (!src) return;
 
-    setAiMetaList((prev) =>
-      prev.map((it, i) => (i === idx ? { ...it, _enhancing: true } : it)),
-    );
-    try {
-      const b64 = await imageUriToPlainBase64(src);
-      if (!b64?.trim()) throw new Error("Could not read image");
+    const markEnhancing = (prev: Record<string, unknown>[]) =>
+      prev.map((it, i) => (i === idx ? { ...it, _enhancing: true } : it));
 
-      console.log("[enhance] calling Gemini enhance…");
-      const outUri = await apiClient.enhanceClothingItemCutout({
-        imageBase64: b64,
-        name: item.name,
-        color: item.color,
-        category: item.category,
-        backdropHex: "#FFFFFF",
+    if (extractDraftId) {
+      const base = (draftItems ?? []).map((it) => ({ ...it }));
+      const next = markEnhancing(base);
+      syncOutfitExtractItemsFromAiMeta(extractDraftId, next);
+      setAiMetaList(next);
+    } else {
+      setAiMetaList(markEnhancing);
+    }
+    try {
+      const originalUri =
+        (typeof item.originalSourceUri === "string" && item.originalSourceUri) ||
+        src;
+      console.log("[enhance] Gemini + Vision…");
+      const outUri = await enhanceViaGeminiAndVision({
+        sourceUri: src,
+        originalUri,
+        box2d: item.box_2d,
+        name: typeof item.name === "string" ? item.name : undefined,
+        color: typeof item.color === "string" ? item.color : undefined,
+        category:
+          typeof item.category === "string" ? item.category : undefined,
       });
-      if (!outUri)
-        throw new Error(
-          "Enhance returned no image — check EXPO_PUBLIC_GOOGLE_AI_API_KEY in .env",
-        );
       console.log("[enhance] success");
-      setAiMetaList((prev) =>
+      const applyEnhance = (prev: Record<string, unknown>[]) =>
         prev.map((it, i) =>
           i === idx
             ? {
                 ...it,
-                sourceUri: outUri,
-                originalSourceUri: it.originalSourceUri ?? it.sourceUri,
-                isIsolated: true,
+                enhancedUri: outUri,
+                is_enhanced: true,
                 _enhancing: false,
-                _displayEpoch: (it._displayEpoch ?? 0) + 1,
+                _displayEpoch: (Number(it._displayEpoch) || 0) + 1,
               }
             : it,
-        ),
-      );
+        );
+      if (extractDraftId) {
+        setAiMetaList((prev) => {
+          const next = applyEnhance(prev);
+          syncOutfitExtractItemsFromAiMeta(extractDraftId, next);
+          return next;
+        });
+      } else {
+        setAiMetaList(applyEnhance);
+      }
       try {
         await Haptics.notificationAsync(
           Haptics.NotificationFeedbackType.Success,
@@ -2294,13 +4713,147 @@ export default function AddScreen() {
       const detail = e instanceof Error ? e.message : String(e);
       console.warn("[enhanceItemAtIndex] FAILED:", detail);
       Alert.alert("Couldn't enhance", detail);
-      setAiMetaList((prev) =>
-        prev.map((it, i) => (i === idx ? { ...it, _enhancing: false } : it)),
-      );
+      const clearEnhancing = (prev: Record<string, unknown>[]) =>
+        prev.map((it, i) => (i === idx ? { ...it, _enhancing: false } : it));
+      if (extractDraftId) {
+        setAiMetaList((prev) => {
+          const next = clearEnhancing(prev);
+          syncOutfitExtractItemsFromAiMeta(extractDraftId, next);
+          return next;
+        });
+      } else {
+        setAiMetaList(clearEnhancing);
+      }
     }
   };
 
+  const closeConfigureModal = useCallback(() => {
+    if (outfitExtractEditDraftId && outfitExtractEditSnapshotRef.current) {
+      syncOutfitDrafts(
+        outfitDraftsRef.current.map((d) =>
+          d.id === outfitExtractEditDraftId
+            ? { ...d, extractItems: [...outfitExtractEditSnapshotRef.current!] }
+            : d,
+        ),
+      );
+      outfitExtractEditSnapshotRef.current = null;
+      setOutfitExtractEditDraftId(null);
+    }
+    setEditIndex(null);
+    setPreviewUri(null);
+  }, [syncOutfitDrafts]);
+
+  const prepareOutfitExtractContext = useCallback(
+    (draftId: string) => {
+      const draft = outfitDraftsRef.current.find((d) => d.id === draftId);
+      if (!draft) return;
+      setOutfitExtractEditDraftId(draftId);
+      setAiMetaList((draft.extractItems ?? []).map((it) => ({ ...it })));
+    },
+    [],
+  );
+
+  const removeOutfitExtractItem = useCallback(
+    (draftId: string, index: number) => {
+      syncOutfitDrafts(
+        outfitDraftsRef.current.map((d) => {
+          if (d.id !== draftId) return d;
+          const next = (d.extractItems ?? []).filter((_, i) => i !== index);
+          return { ...d, extractItems: next };
+        }),
+      );
+    },
+    [syncOutfitDrafts],
+  );
+
+  const enhanceOutfitExtractItem = useCallback(
+    async (draftId: string, idx: number) => {
+      prepareOutfitExtractContext(draftId);
+      await enhanceItemAtIndex(idx, draftId);
+    },
+    [prepareOutfitExtractContext],
+  );
+
+  const adjustOutfitExtractItem = useCallback(
+    (draftId: string, idx: number) => {
+      prepareOutfitExtractContext(draftId);
+      setManualCropIndex(idx);
+    },
+    [prepareOutfitExtractContext],
+  );
+
+  const openOutfitExtractReview = useCallback(
+    (draftId: string) => {
+      const draft = outfitDraftsRef.current.find((d) => d.id === draftId);
+      if (!draft) return;
+      prepareOutfitExtractContext(draftId);
+      setImage(draft.originalUri);
+      setOutfitExtractReviewDraftId(draftId);
+    },
+    [prepareOutfitExtractContext],
+  );
+
+  const closeOutfitExtractReview = useCallback(() => {
+    setOutfitExtractReviewDraftId(null);
+    setEditIndex(null);
+    setPreviewUri(null);
+    setManualCropIndex(null);
+  }, []);
+
+  useEffect(() => {
+    if (!outfitExtractReviewDraftId || editIndex !== null) return;
+    const draft = outfitDrafts.find((d) => d.id === outfitExtractReviewDraftId);
+    if (!draft) return;
+    setAiMetaList((draft.extractItems ?? []).map((it) => ({ ...it })));
+    setImage(draft.originalUri);
+  }, [outfitDrafts, outfitExtractReviewDraftId, editIndex]);
+
+  const outfitExtractReviewReadyCount = useMemo(() => {
+    if (!outfitExtractReviewDraftId) return 0;
+    return aiMetaList.filter(
+      (it) => !(it._classifying || it._scanning),
+    ).length;
+  }, [aiMetaList, outfitExtractReviewDraftId]);
+
+  const outfitExtractReviewSaveBlocked =
+    !!outfitExtractReviewDraftId &&
+    (savingOutfitPhoto ||
+      outfitExtractReviewReadyCount === 0 ||
+      aiMetaList.some((i) => isItemClassifying(i) || i._enhancing));
+
+  const openOutfitExtractEdit = useCallback(
+    (draftId: string, idx: number) => {
+      const draft = outfitDraftsRef.current.find((d) => d.id === draftId);
+      const items = draft?.extractItems ?? [];
+      const item = items[idx];
+      if (!item || item._classifying || item._scanning) return;
+      outfitExtractEditSnapshotRef.current = items.map((it) => ({ ...it }));
+      setOutfitExtractEditDraftId(draftId);
+      setAiMetaList(items.map((it) => ({ ...it })));
+      const categoryDefault =
+        (typeof item?.category === "string" && item.category.trim()) ||
+        categoryHintShelfId ||
+        "";
+      setEditForm({
+        name: typeof item?.name === "string" ? item.name : "",
+        category: categoryDefault,
+        color: typeof item?.color === "string" ? item.color : "",
+        occasions: Array.isArray(item?.occasions)
+          ? [...(item.occasions as string[])]
+          : [],
+        seasons: Array.isArray(item?.seasons)
+          ? [...(item.seasons as string[])]
+          : warmthToSeasons(
+              typeof item?.warmth === "string" ? item.warmth : undefined,
+            ),
+      });
+      setEditIndex(idx);
+    },
+    [categoryHintShelfId],
+  );
+
   const openUploadEdit = (idx: number) => {
+    if (outfitExtractEditDraftId) return;
     const item = aiMetaList[idx];
     const categoryDefault =
       (item?.category && String(item.category).trim()) ||
@@ -2314,26 +4867,96 @@ export default function AddScreen() {
       seasons: [...(item?.seasons || warmthToSeasons(item?.warmth))],
     });
     setEditIndex(idx);
-    setConfigCarouselPage(0);
   };
 
-  const saveUploadEdit = () => {
-    if (editIndex !== null) {
+  const handleManualCropSave = ({
+    sourceUri,
+    box2d,
+  }: {
+    sourceUri: string;
+    box2d: number[];
+  }) => {
+    if (manualCropIndex === null) return;
+    const patch = {
+      sourceUri,
+      box_2d: box2d,
+      isIsolated: true,
+      _manualCrop: true,
+      enhancedUri: undefined,
+      is_enhanced: false,
+      _displayEpoch: 0,
+    };
+    if (outfitExtractEditDraftId) {
+      syncOutfitDrafts(
+        outfitDraftsRef.current.map((d) => {
+          if (d.id !== outfitExtractEditDraftId) return d;
+          const items = [...(d.extractItems ?? [])];
+          if (manualCropIndex >= 0 && manualCropIndex < items.length) {
+            const prev = items[manualCropIndex]!;
+            items[manualCropIndex] = {
+              ...prev,
+              ...patch,
+              _displayEpoch: (Number(prev._displayEpoch) || 0) + 1,
+            };
+          }
+          return { ...d, extractItems: items };
+        }),
+      );
       setAiMetaList((prev) =>
         prev.map((it, i) =>
-          i === editIndex
+          i === manualCropIndex
             ? {
                 ...it,
-                name: editForm.name,
-                category: editForm.category,
-                color: editForm.color,
-                occasions: editForm.occasions,
-                seasons: editForm.seasons,
-                warmth: seasonsToWarmth(editForm.seasons),
+                ...patch,
+                _displayEpoch: (Number(it._displayEpoch) || 0) + 1,
               }
             : it,
         ),
       );
+    } else {
+      setAiMetaList((prev) =>
+        prev.map((it, i) =>
+          i === manualCropIndex
+            ? {
+                ...it,
+                ...patch,
+                _displayEpoch: (Number(it._displayEpoch) || 0) + 1,
+              }
+            : it,
+        ),
+      );
+    }
+    setManualCropIndex(null);
+  };
+
+  const saveUploadEdit = () => {
+    if (editIndex !== null) {
+      const patch = {
+        name: editForm.name,
+        category: editForm.category,
+        color: editForm.color,
+        occasions: editForm.occasions,
+        seasons: editForm.seasons,
+        warmth: seasonsToWarmth(editForm.seasons),
+      };
+      if (outfitExtractEditDraftId) {
+        const nextItems = aiMetaList.map((it, i) =>
+          i === editIndex ? { ...it, ...patch } : it,
+        );
+        syncOutfitDrafts(
+          outfitDraftsRef.current.map((d) =>
+            d.id === outfitExtractEditDraftId
+              ? { ...d, extractItems: nextItems }
+              : d,
+          ),
+        );
+        outfitExtractEditSnapshotRef.current = null;
+        setOutfitExtractEditDraftId(null);
+      } else {
+        setAiMetaList((prev) =>
+          prev.map((it, i) => (i === editIndex ? { ...it, ...patch } : it)),
+        );
+      }
     }
     setEditIndex(null);
     setPreviewUri(null);
@@ -2347,6 +4970,14 @@ export default function AddScreen() {
     setLibraryBanner(null);
     setLibrarySettingsCta(false);
     setCapturedPhotos([]);
+    replaceOutfitReviewQueue([]);
+    setOutfitReviewBatch(null);
+    syncOutfitDrafts([]);
+    setOutfitName("");
+    setOutfitSchedule("none");
+    setOutfitPickIso(null);
+    setPendingLinkOutfitId(null);
+    outfitOriginalUriRef.current = null;
     setStatus("scanning");
   };
 
@@ -2355,6 +4986,363 @@ export default function AddScreen() {
     else router.back();
   };
 
+  const handleOutfitLeave = useCallback(() => {
+    const n = outfitDraftsRef.current.length;
+    const hasCaptures = capturedPhotos.length > 0;
+    const isProcessing = status === "outfit_processing";
+    if (n === 0 && !hasCaptures && !isProcessing) {
+      void clearOutfitUploadRecoverySession(uploadUserId);
+      outfitRecoverySessionRef.current = null;
+      leaveAddItemsFlow();
+      return;
+    }
+    Alert.alert(
+      "Leave without saving?",
+      n > 0
+        ? `${n} look${n === 1 ? "" : "s"} won't be saved to Fits.`
+        : "Your photos won't be saved.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Discard",
+          style: "destructive",
+          onPress: () => {
+            void (async () => {
+              if (outfitPersistTimerRef.current) {
+                clearTimeout(outfitPersistTimerRef.current);
+                outfitPersistTimerRef.current = null;
+              }
+              await clearOutfitUploadRecoverySession(uploadUserId);
+              outfitRecoverySessionRef.current = null;
+              syncOutfitDrafts([]);
+              replaceOutfitReviewQueue([]);
+              setOutfitReviewBatch(null);
+              setCapturedPhotos([]);
+              suppressRecoveryPrompt();
+              leaveAddItemsFlow();
+            })();
+          },
+        },
+      ],
+    );
+  }, [
+    capturedPhotos.length,
+    replaceOutfitReviewQueue,
+    status,
+    syncOutfitDrafts,
+    uploadUserId,
+  ]);
+
+  useEffect(() => {
+    handleOutfitLeaveRef.current = handleOutfitLeave;
+  }, [handleOutfitLeave]);
+
+  const saveAllOutfitDrafts = useCallback(async () => {
+    if (!user?.id || outfitDraftsRef.current.length === 0) {
+      Alert.alert("Sign in", "Sign in to save outfits.");
+      return;
+    }
+    setSavingOutfitPhoto(true);
+    try {
+      await saveOutfitUploadDrafts(user.id, outfitDraftsRef.current);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      await clearOutfitUploadRecoverySession(user.id);
+      outfitRecoverySessionRef.current = null;
+      syncOutfitDrafts([]);
+      suppressRecoveryPrompt();
+      leaveAddItemsFlow();
+    } catch (e) {
+      Alert.alert("Save failed", formatUnknownError(e));
+    } finally {
+      setSavingOutfitPhoto(false);
+    }
+  }, [router, syncOutfitDrafts, user?.id]);
+
+  const updateOutfitDraft = useCallback(
+    (id: string, patch: Partial<OutfitUploadDraft>) => {
+      syncOutfitDrafts(
+        outfitDraftsRef.current.map((d) =>
+          d.id === id ? { ...d, ...patch } : d,
+        ),
+      );
+    },
+    [syncOutfitDrafts],
+  );
+
+  const finishOutfitDraftReview = useCallback(
+    async (draftId: string) => {
+      const draft = outfitDraftsRef.current.find((d) => d.id === draftId);
+      if (!draft || !user?.id) {
+        Alert.alert("Sign in", "Sign in to save outfits.");
+        return;
+      }
+      setSavingOutfitPhoto(true);
+      try {
+        if (draft.savedOutfitId) {
+          const remaining = outfitDraftsRef.current.filter(
+            (d) => d.id !== draftId,
+          );
+          if (remaining.length === 0) {
+            await clearOutfitUploadRecoverySession(user.id);
+            outfitRecoverySessionRef.current = null;
+            syncOutfitDrafts([]);
+          } else {
+            syncOutfitDrafts(remaining);
+            await persistOutfitDraftsToSession(remaining, "review");
+          }
+          suppressRecoveryPrompt();
+          leaveAddItemsFlow();
+          return;
+        }
+        const idx = outfitDraftsRef.current.findIndex((d) => d.id === draftId);
+        await saveOutfitUploadDraft(user.id, draft, idx);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        const remaining = outfitDraftsRef.current.filter(
+          (d) => d.id !== draftId,
+        );
+        if (remaining.length === 0) {
+          await clearOutfitUploadRecoverySession(user.id);
+          outfitRecoverySessionRef.current = null;
+          syncOutfitDrafts([]);
+          suppressRecoveryPrompt();
+          leaveAddItemsFlow();
+        } else {
+          syncOutfitDrafts(remaining);
+          await persistOutfitDraftsToSession(remaining, "review");
+        }
+      } catch (e) {
+        Alert.alert("Save failed", formatUnknownError(e));
+      } finally {
+        setSavingOutfitPhoto(false);
+      }
+    },
+    [persistOutfitDraftsToSession, router, syncOutfitDrafts, user?.id],
+  );
+
+  const startOutfitDraftExtract = useCallback(
+    async (draftId: string) => {
+      const draft = outfitDraftsRef.current.find((d) => d.id === draftId);
+      if (!draft || !user?.id || draft.extractScanning) return;
+      // Flip to "scanning" FIRST, before the (sometimes slow) outfit-row
+      // save below — that save only happens on the very first extract, and
+      // while it's in flight extractScanning was still false, so the item
+      // strip fell through to its "Scan this look…" empty-state prompt for
+      // however long the network call took. Read as a spurious "no items
+      // found" flash even though nothing had actually failed yet.
+      updateOutfitDraft(draftId, {
+        extractScanning: true,
+        extractItems: [],
+        savedExtractItemIds: undefined,
+      });
+      setSavingOutfitPhoto(true);
+      try {
+        let outfitId = draft.savedOutfitId ?? null;
+        if (!outfitId) {
+          const idx = outfitDraftsRef.current.findIndex((d) => d.id === draftId);
+          outfitId = await saveOutfitUploadDraft(user.id, draft, idx);
+          updateOutfitDraft(draftId, { savedOutfitId: outfitId });
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        }
+        if (editIndex !== null) closeConfigureModal();
+        prepareOutfitExtractContext(draftId);
+        setImage(draft.originalUri);
+        setOutfitExtractReviewDraftId(draftId);
+        setSavingOutfitPhoto(false);
+
+        const setExtractItems: AiMetaUpdater = (fn) => {
+          syncOutfitDrafts(
+            outfitDraftsRef.current.map((d) =>
+              d.id === draftId
+                ? { ...d, extractItems: fn(d.extractItems ?? []) }
+                : d,
+            ),
+          );
+        };
+
+        const b64 = await uriToBase64(draft.originalUri);
+        const found = await processImageInto(
+          b64,
+          draft.originalUri,
+          setExtractItems,
+        );
+        updateOutfitDraft(draftId, { extractScanning: false });
+        if (found === 0) {
+          Alert.alert(
+            "No items found",
+            "We couldn't pull any pieces out of this look. You can still save the outfit photo on its own.",
+          );
+        }
+      } catch (e) {
+        updateOutfitDraft(draftId, { extractScanning: false });
+        Alert.alert("Extraction failed", formatUnknownError(e));
+      } finally {
+        setSavingOutfitPhoto(false);
+      }
+    },
+    [closeConfigureModal, prepareOutfitExtractContext, syncOutfitDrafts, updateOutfitDraft, user?.id],
+  );
+
+  const saveOutfitDraftExtractItems = useCallback(
+    async (draftId: string) => {
+      const draft = outfitDraftsRef.current.find((d) => d.id === draftId);
+      const outfitId = draft?.savedOutfitId;
+      const items = (draft?.extractItems ?? []).filter(
+        (it) => !(it._classifying || it._scanning),
+      );
+      if (!draft || !outfitId || !user?.id || items.length === 0) return;
+      if (!(await confirmLowConfidenceItems(items))) return;
+
+      setSavingOutfitPhoto(true);
+      try {
+        const session = await persistUploadReviewSession({
+          userId: user.id,
+          aiMetaList: items,
+          imageUri: draft.originalUri,
+          linkOutfitId: outfitId,
+          existingSession: recoverySessionRef.current,
+        });
+        if (!session) {
+          Alert.alert("Save error", "Could not prepare your upload session.");
+          return;
+        }
+        recoverySessionRef.current = session;
+        const { session: updatedSession, insertedIds, allSaved } =
+          await saveUploadSessionToCloset(
+            session,
+            supabase,
+            user.id,
+            buildClothingItemRow,
+          );
+        recoverySessionRef.current = updatedSession;
+        if (insertedIds.length === 0) {
+          Alert.alert("Save error", "Could not save pieces to your closet.");
+          return;
+        }
+        await attachClothingItemsToOutfit(supabase, outfitId, insertedIds);
+        DeviceEventEmitter.emit("closetItemsSaved");
+        DeviceEventEmitter.emit("outfitItemsExtracted", {
+          outfitId,
+          itemIds: insertedIds,
+        });
+        if (allSaved) {
+          await clearUploadRecoverySession(user.id);
+          recoverySessionRef.current = null;
+        }
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        // Keep extractItems intact — it's what the palette row, item strip,
+        // "Review items" button, and footer label all render from. Wiping
+        // it to [] here was the bug: the moment you hit Done, the whole
+        // pieces UI collapsed back to its never-extracted empty state (and
+        // stayed that way on revisit, since this is the persisted draft
+        // state), even though the pieces WERE saved. savedExtractItemIds is
+        // just the "already saved, don't re-save" gate (see hasUnsavedPieces
+        // above) — it doesn't need extractItems cleared to do that job.
+        updateOutfitDraft(draftId, {
+          savedExtractItemIds: insertedIds,
+        });
+      } catch (e) {
+        Alert.alert("Save failed", formatUnknownError(e));
+      } finally {
+        setSavingOutfitPhoto(false);
+      }
+    },
+    [updateOutfitDraft, user?.id],
+  );
+
+  const removeOutfitDraft = useCallback(
+    (id: string) => {
+      const next = outfitDraftsRef.current.filter((d) => d.id !== id);
+      syncOutfitDrafts(next);
+      if (next.length === 0) {
+        void clearOutfitUploadRecoverySession(uploadUserId);
+        outfitRecoverySessionRef.current = null;
+        setStatus("scanning");
+      } else {
+        void persistOutfitDraftsToSession(next, "review");
+      }
+    },
+    [persistOutfitDraftsToSession, syncOutfitDrafts, uploadUserId],
+  );
+
+  const addMoreOutfitPhotos = useCallback(async () => {
+    const libPerm = await requestLibraryAccessWithPriming();
+    if (!libPerm.granted) {
+      Alert.alert("Photo library access needed", "Enable it in Settings.", [
+        { text: "Cancel", style: "cancel" },
+        { text: "Open Settings", onPress: () => Linking.openSettings() },
+      ]);
+      return;
+    }
+    let res: Awaited<ReturnType<typeof ImagePicker.launchImageLibraryAsync>>;
+    try {
+      res = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsMultipleSelection: true,
+        selectionLimit: MAX_LIBRARY_PHOTOS,
+        orderedSelection: true,
+        quality: 0.85,
+        base64: false,
+      });
+    } catch {
+      return;
+    }
+    if (res.canceled || res.assets.length === 0) return;
+    const jpegs = await Promise.all(
+      res.assets.map((a) => ensureJpegUri(a.uri)),
+    );
+    await prepareOutfitDraftBatch(jpegs, { append: true });
+  }, [prepareOutfitDraftBatch]);
+
+  const handleReviewClose = useCallback(() => {
+    const hasUnsavedWork =
+      aiMetaList.length > 0 ||
+      !!image ||
+      !!batchAnalyze ||
+      reviewItemsStillLoading ||
+      reviewEnhancing;
+
+    if (!hasUnsavedWork) {
+      void clearUploadRecoverySession(uploadUserId);
+      recoverySessionRef.current = null;
+      leaveAddItemsFlow();
+      return;
+    }
+
+    const n = aiMetaList.length;
+    Alert.alert(
+      "Leave without saving?",
+      n > 0
+        ? `${n} item${n === 1 ? "" : "s"} won't be added to your closet.`
+        : "Your scan won't be added to your closet.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Discard",
+          style: "destructive",
+          onPress: () => {
+            void (async () => {
+              if (persistReviewTimerRef.current) {
+                clearTimeout(persistReviewTimerRef.current);
+                persistReviewTimerRef.current = null;
+              }
+              await clearUploadRecoverySession(uploadUserId);
+              recoverySessionRef.current = null;
+              suppressRecoveryPrompt();
+              leaveAddItemsFlow();
+            })();
+          },
+        },
+      ],
+    );
+  }, [
+    aiMetaList.length,
+    batchAnalyze,
+    image,
+    reviewItemsStillLoading,
+    reviewEnhancing,
+    uploadUserId,
+  ]);
+
   const pickDifferentLibraryPhoto = async () => {
     setImage(null);
     setAiMetaList([]);
@@ -2362,238 +5350,633 @@ export default function AddScreen() {
     setPreviewUri(null);
     setLibraryBanner(null);
     setLibrarySettingsCta(false);
+    replaceOutfitReviewQueue([]);
+    setOutfitReviewBatch(null);
+    syncOutfitDrafts([]);
+    setOutfitName("");
+    setOutfitSchedule("none");
+    setOutfitPickIso(null);
     setStatus("scanning");
     await pickImages();
   };
 
-  if (!permission) return <View style={styles.container} />;
   if (
-    uploadSource === "camera" &&
-    !permission.granted &&
-    !libraryAutoPickPending
+    isExtractForOutfitMode &&
+    aiMetaList.length === 0 &&
+    (status === "analyzing" ||
+      status === "scanning" ||
+      status === "review")
   ) {
     return (
-      <View style={styles.permissionScreen}>
-        <ArcGallery color={Colors.black} />
-        <Text style={styles.permTitle}>Archive Camera</Text>
-        <Text style={styles.permSub}>
-          Authorize access to digitize your wardrobe.
+      <View
+        style={[
+          styles.container,
+          {
+            justifyContent: "center",
+            alignItems: "center",
+            paddingHorizontal: 32,
+            gap: 12,
+          },
+        ]}
+      >
+        <ActivityIndicator size="large" color={Colors.accent} />
+        <Text style={styles.extractionTitle}>Extracting pieces…</Text>
+        <Text style={styles.extractionSub}>
+          Scanning your look photo for individual items.
         </Text>
-        <TouchableOpacity style={Styles.btnPrimary} onPress={requestPermission}>
-          <Text style={Styles.btnPrimaryText}>ALLOW CAMERA</Text>
-        </TouchableOpacity>
       </View>
     );
   }
 
-  const renderReviewItemsBody = (headerPadTop: number) => {
-    if (status !== "review" || !image) return null;
+  if (status === "outfit_review" && outfitDrafts.length > 0) {
+    return (
+      <GestureHandlerRootView style={styles.container}>
+        <OutfitUploadReview
+          drafts={outfitDrafts}
+          saving={savingOutfitPhoto}
+          datePickOptions={datePickOptions}
+          onClose={handleOutfitLeave}
+          onUpdateDraft={updateOutfitDraft}
+          onRemoveDraft={removeOutfitDraft}
+          onAddPhotos={() => void addMoreOutfitPhotos()}
+          onSaveAll={() => void saveAllOutfitDrafts()}
+          onFinishDraft={(id) => void finishOutfitDraftReview(id)}
+          onStartExtract={(id) => void startOutfitDraftExtract(id)}
+          onOpenExtractReview={(id) => openOutfitExtractReview(id)}
+          onExtractItemPress={(draftId, idx) => {
+            openOutfitExtractReview(draftId);
+            if (idx >= 0) openOutfitExtractEdit(draftId, idx);
+          }}
+          onSaveExtractItems={(id) => void saveOutfitDraftExtractItems(id)}
+        />
+        {outfitExtractReviewDraftId && image && editIndex === null ? (
+          <View
+            style={[StyleSheet.absoluteFillObject, { zIndex: 20 }]}
+            pointerEvents="box-none"
+          >
+            <View
+              style={[
+                styles.reviewWrapper,
+                styles.reviewWrapperHost,
+                styles.reviewBackdropHost,
+                StyleSheet.absoluteFillObject,
+              ]}
+            >
+              <View style={styles.reviewBackdrop}>
+                <Image
+                  source={{ uri: image }}
+                  style={styles.reviewBackdropImage}
+                  resizeMode="cover"
+                />
+                <BlurView
+                  intensity={28}
+                  tint="light"
+                  style={StyleSheet.absoluteFillObject}
+                />
+              </View>
+              <View style={[styles.reviewSheet, { top: insets.top }]}>
+                <View style={styles.reviewSheetHandleArea}>
+                  <View style={styles.dragHandle} />
+                </View>
+                <ScrollView
+                  style={styles.reviewSheetScroll}
+                  contentContainerStyle={[
+                    styles.scrollContent,
+                    { paddingBottom: reviewScrollBottomPad },
+                  ]}
+                  showsVerticalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                >
+                  {renderReviewItemsBody(6, outfitExtractReviewDraftId)}
+                </ScrollView>
+                <View
+                  style={[
+                    styles.reviewStickyBar,
+                    { paddingBottom: Math.max(insets.bottom, 16) },
+                  ]}
+                >
+                  <TouchableOpacity
+                    style={styles.reviewStickySecondary}
+                    onPress={closeOutfitExtractReview}
+                    disabled={savingOutfitPhoto}
+                  >
+                    <Text style={styles.reviewStickySecondaryText}>
+                      Back to look
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.reviewStickyPrimary,
+                      outfitExtractReviewSaveBlocked &&
+                        styles.reviewStickyPrimaryDisabled,
+                    ]}
+                    onPress={() => {
+                      if (!outfitExtractReviewDraftId) return;
+                      void saveOutfitDraftExtractItems(
+                        outfitExtractReviewDraftId,
+                      ).then(() => closeOutfitExtractReview());
+                    }}
+                    disabled={outfitExtractReviewSaveBlocked}
+                  >
+                    {savingOutfitPhoto ? (
+                      <ActivityIndicator color={Colors.white} />
+                    ) : (
+                      <Text style={styles.reviewStickyPrimaryText}>
+                        Add to closet
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          </View>
+        ) : null}
+        {editIndex !== null ? (
+          <>
+            <Modal
+              visible
+              transparent
+              animationType="fade"
+              onRequestClose={closeConfigureModal}
+            >
+              <View style={styles.uploadEditBackdrop}>
+                <BlurView
+                  intensity={60}
+                  tint="dark"
+                  style={StyleSheet.absoluteFill}
+                />
+                <TouchableOpacity
+                  activeOpacity={1}
+                  style={styles.uploadEditBackdropDismiss}
+                  onPress={closeConfigureModal}
+                />
+                <View
+                  style={[
+                    styles.uploadEditCard,
+                    { paddingBottom: Math.max(insets.bottom, 16) },
+                  ]}
+                >
+                  <ScrollView
+                    contentContainerStyle={styles.uploadEditScrollContent}
+                    showsVerticalScrollIndicator={false}
+                    keyboardShouldPersistTaps="handled"
+                    automaticallyAdjustKeyboardInsets
+                  >
+                  <View style={styles.uploadEditHeader}>
+                    <Text style={styles.uploadEditTitle}>Configure</Text>
+                    <TouchableOpacity
+                      onPress={closeConfigureModal}
+                      hitSlop={{ top: 10, right: 10, bottom: 10, left: 10 }}
+                      style={styles.uploadEditCloseBtn}
+                    >
+                      <ArcClose color={Colors.textMuted} />
+                    </TouchableOpacity>
+                  </View>
+
+                  <Text style={styles.uploadEditLabel}>Name</Text>
+                  <TextInput
+                    style={styles.uploadEditInput}
+                    value={editForm.name}
+                    onChangeText={(t) =>
+                      setEditForm((prev) => ({ ...prev, name: t }))
+                    }
+                    placeholder="e.g. Vintage wash tee"
+                    placeholderTextColor={Colors.textMuted}
+                  />
+
+                  <Text style={styles.uploadEditLabel}>Category</Text>
+                  <View style={styles.uploadEditChipRow}>
+                    {UPLOAD_SNAP_CATEGORIES.map((cat) => {
+                      const isOn =
+                        editForm.category.toLowerCase() ===
+                        cat.id.toLowerCase();
+                      return (
+                        <TouchableOpacity
+                          key={cat.id}
+                          style={[
+                            styles.uploadEditChip,
+                            isOn && styles.uploadEditChipOn,
+                          ]}
+                          onPress={() =>
+                            setEditForm((prev) => ({
+                              ...prev,
+                              category: cat.id,
+                            }))
+                          }
+                        >
+                          <Text
+                            style={[
+                              styles.uploadEditChipText,
+                              isOn && styles.uploadEditChipTextOn,
+                            ]}
+                          >
+                            {cat.label}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+
+                  <Text style={styles.uploadEditLabel}>Color</Text>
+                  <TouchableOpacity
+                    style={styles.uploadColorTrigger}
+                    onPress={() => setUploadColorPickerOpen(true)}
+                    activeOpacity={0.88}
+                  >
+                    <ColorPickerTriggerIcon size={32} />
+                    <Text
+                      style={styles.uploadColorTriggerTitle}
+                      numberOfLines={1}
+                    >
+                      {editForm.color?.trim()
+                        ? editForm.color
+                        : "Choose color"}
+                    </Text>
+                  </TouchableOpacity>
+
+                  <Text style={styles.uploadEditLabel}>Occasions</Text>
+                  <View style={styles.uploadEditChipRow}>
+                    {OCCASIONS_FLAT.map((occ) => {
+                      const isOn = editForm.occasions
+                        .map((o) => o.toLowerCase())
+                        .includes(occ.id.toLowerCase());
+                      return (
+                        <TouchableOpacity
+                          key={occ.id}
+                          style={[
+                            styles.uploadEditChip,
+                            isOn && styles.uploadEditChipOn,
+                          ]}
+                          onPress={() => {
+                            const next = isOn
+                              ? editForm.occasions.filter(
+                                  (o) =>
+                                    o.toLowerCase() !== occ.id.toLowerCase(),
+                                )
+                              : [...editForm.occasions, occ.id];
+                            setEditForm((prev) => ({
+                              ...prev,
+                              occasions: next,
+                            }));
+                          }}
+                        >
+                          <Text
+                            style={[
+                              styles.uploadEditChipText,
+                              isOn && styles.uploadEditChipTextOn,
+                            ]}
+                          >
+                            {occ.label}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+
+                  <Text style={styles.uploadEditLabel}>Weather</Text>
+                  <View style={styles.uploadEditChipRow}>
+                    {(
+                      [
+                        { id: "spring", label: "Spring" },
+                        { id: "summer", label: "Summer" },
+                        { id: "fall", label: "Fall" },
+                        { id: "winter", label: "Winter" },
+                        { id: "all", label: "All seasons" },
+                      ] as const
+                    ).map((season) => {
+                      const isOn = editForm.seasons
+                        .map((x) => x.toLowerCase())
+                        .includes(season.id);
+                      return (
+                        <TouchableOpacity
+                          key={season.id}
+                          style={[
+                            styles.uploadEditChip,
+                            isOn && styles.uploadEditChipOn,
+                          ]}
+                          onPress={() => {
+                            let next: string[];
+                            if (season.id === "all") {
+                              next = isOn ? [] : ["all"];
+                            } else {
+                              const withoutAll = editForm.seasons.filter(
+                                (x) => x !== "all",
+                              );
+                              next = isOn
+                                ? withoutAll.filter((x) => x !== season.id)
+                                : [...withoutAll, season.id];
+                            }
+                            setEditForm((prev) => ({
+                              ...prev,
+                              seasons: next,
+                            }));
+                          }}
+                        >
+                          <Text
+                            style={[
+                              styles.uploadEditChipText,
+                              isOn && styles.uploadEditChipTextOn,
+                            ]}
+                          >
+                            {season.label}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+
+                  <View style={styles.uploadEditActions}>
+                    <TouchableOpacity
+                      style={styles.uploadEditCancelBtn}
+                      onPress={closeConfigureModal}
+                    >
+                      <Text style={styles.uploadEditCancelText}>Cancel</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.uploadEditSaveBtn}
+                      onPress={saveUploadEdit}
+                    >
+                      <Text style={styles.uploadEditSaveText}>Save</Text>
+                    </TouchableOpacity>
+                  </View>
+                  </ScrollView>
+                </View>
+              </View>
+            </Modal>
+            <IosStyleColorPickerModal
+              variant="item"
+              visible={uploadColorPickerOpen}
+              onClose={() => setUploadColorPickerOpen(false)}
+              itemValue={editForm.color}
+              onSelectItem={(c) => {
+                setEditForm((prev) => ({ ...prev, color: c }));
+                setUploadColorPickerOpen(false);
+              }}
+            />
+          </>
+        ) : null}
+        <ManualCropModal
+          visible={manualCropIndex !== null}
+          imageUri={
+            manualCropIndex !== null
+              ? (aiMetaList[manualCropIndex]?.originalSourceUri ??
+                aiMetaList[manualCropIndex]?.sourceUri ??
+                null)
+              : null
+          }
+          initialBox={
+            manualCropIndex !== null &&
+            Array.isArray(aiMetaList[manualCropIndex]?.box_2d)
+              ? (aiMetaList[manualCropIndex]?.box_2d as number[])
+              : null
+          }
+          onCancel={() => setManualCropIndex(null)}
+          onSave={handleManualCropSave}
+        />
+      </GestureHandlerRootView>
+    );
+  }
+
+  if (!permission) return <View style={styles.container} />;
+  if (
+    DEV_LOCK_CAMERA_PERMISSION_SCREEN ||
+    (uploadSource === "camera" &&
+      !permission.granted &&
+      !libraryAutoPickPending)
+  ) {
+    const permissionPermanentlyDenied =
+      !DEV_LOCK_CAMERA_PERMISSION_SCREEN && permission.canAskAgain === false;
+    const handleCameraPermission = async () => {
+      if (DEV_LOCK_CAMERA_PERMISSION_SCREEN) return;
+      if (permissionPermanentlyDenied) {
+        await Linking.openSettings();
+        return;
+      }
+      const result = await requestPermission();
+      if (!result.granted && result.canAskAgain === false) {
+        Alert.alert(
+          "Camera access is off",
+          "You can enable camera access for myOOTD in Settings.",
+          [
+            { text: "Not now", style: "cancel" },
+            { text: "Open Settings", onPress: () => void Linking.openSettings() },
+          ],
+        );
+      }
+    };
+    const choosePhotosInstead = () => {
+      if (DEV_LOCK_CAMERA_PERMISSION_SCREEN) return;
+      setUploadSource("library");
+      void pickImages();
+    };
+
+    return (
+      <View
+        style={[
+          styles.permissionScreen,
+          {
+            paddingTop: insets.top + 10,
+            paddingBottom: Math.max(insets.bottom, 18),
+          },
+        ]}
+      >
+        <View style={styles.permissionTopBar}>
+          <TouchableOpacity
+            style={styles.permissionCloseBtn}
+            onPress={() => {
+              if (!DEV_LOCK_CAMERA_PERMISSION_SCREEN) router.back();
+            }}
+            activeOpacity={0.72}
+            accessibilityRole="button"
+            accessibilityLabel="Close"
+          >
+            <X size={18} color={Colors.text} strokeWidth={2.4} />
+          </TouchableOpacity>
+          <Text style={styles.permissionTopTitle}>Add items</Text>
+          <View style={styles.permissionTopSpacer} />
+        </View>
+
+        <ScrollView
+          style={styles.permissionScroll}
+          contentContainerStyle={styles.permissionScrollContent}
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+          <Text style={styles.permTitle}>
+            {permissionPermanentlyDenied
+              ? "Camera access is\nturned off"
+              : "Let myOOTD use\nyour camera"}
+          </Text>
+          <Text style={styles.permSub}>
+            {permissionPermanentlyDenied
+              ? "Re-enable camera access for myOOTD in Settings, then come back to start shooting."
+              : "Your device will ask you to confirm."}
+          </Text>
+
+          <View style={styles.permCard}>
+            <View style={styles.permRow}>
+              <View style={styles.permRowIcon}>
+                <Camera size={19} color={Colors.text} strokeWidth={2} />
+              </View>
+              <View style={styles.permRowText}>
+                <Text style={styles.permRowTitle}>Snap outfits & pieces</Text>
+                <Text style={styles.permRowSub}>
+                  Photograph a full look or a single item to add it.
+                </Text>
+              </View>
+            </View>
+            <View style={styles.permDivider} />
+            <View style={styles.permRow}>
+              <View style={styles.permRowIcon}>
+                <Shirt size={19} color={Colors.text} strokeWidth={2} />
+              </View>
+              <View style={styles.permRowText}>
+                <Text style={styles.permRowTitle}>Auto-sorted closet</Text>
+                <Text style={styles.permRowSub}>
+                  We isolate garments and file them for you.
+                </Text>
+              </View>
+            </View>
+            <View style={styles.permDivider} />
+            <View style={styles.permRow}>
+              <View style={styles.permRowIcon}>
+                <ShieldCheck size={19} color={Colors.text} strokeWidth={2} />
+              </View>
+              <View style={styles.permRowText}>
+                <Text style={styles.permRowTitle}>Private by default</Text>
+                <Text style={styles.permRowSub}>
+                  Only you can see your photos — nobody else ever will.
+                </Text>
+              </View>
+            </View>
+          </View>
+        </ScrollView>
+
+        <View style={styles.permissionFooter}>
+          <TouchableOpacity
+            style={styles.permissionPrimaryBtn}
+            onPress={() => void handleCameraPermission()}
+            activeOpacity={0.86}
+          >
+            <Text style={styles.permissionPrimaryText}>
+              {permissionPermanentlyDenied ? "Open Settings" : "Allow camera access"}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.permissionSecondaryBtn}
+            onPress={choosePhotosInstead}
+            activeOpacity={0.8}
+          >
+            <Images size={17} color={Colors.text} strokeWidth={2.1} />
+            <Text style={styles.permissionSecondaryText}>Choose from photos instead</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  function renderReviewItemsBody(
+    headerPadTop: number,
+    extractDraftId?: string | null,
+  ) {
+    const extractId = extractDraftId ?? null;
+    const isOutfitExtractReview = !!extractId;
+    if (
+      !isOutfitExtractReview &&
+      (status !== "review" && status !== "analyzing" || !image)
+    ) {
+      return null;
+    }
+    if (isOutfitExtractReview && !image) return null;
+    const fallbackPhotoUri = image ?? "";
+
+    const onCloseReview = isOutfitExtractReview
+      ? closeOutfitExtractReview
+      : handleReviewClose;
+    const onRemoveAt = (idx: number) => {
+      if (isOutfitExtractReview && extractId) {
+        removeOutfitExtractItem(extractId, idx);
+      } else {
+        removeItem(idx);
+      }
+    };
+    const onConfigureAt = (idx: number) => {
+      if (isOutfitExtractReview && extractId) {
+        openOutfitExtractEdit(extractId, idx);
+      } else {
+        openUploadEdit(idx);
+      }
+    };
+    const onEnhanceAt = (idx: number) => {
+      if (isOutfitExtractReview && extractId) {
+        void enhanceOutfitExtractItem(extractId, idx);
+      } else {
+        void enhanceItemAtIndex(idx);
+      }
+    };
+    const onAdjustAt = (idx: number) => {
+      if (isOutfitExtractReview && extractId) {
+        adjustOutfitExtractItem(extractId, idx);
+      } else {
+        setManualCropIndex(idx);
+      }
+    };
+
     return (
       <>
         <View style={[styles.snapReviewHeader, { paddingTop: headerPadTop }]}>
           <View style={styles.reviewHeaderRow}>
-            <Text style={styles.snapReviewTitle}>Review items</Text>
+            <Text style={styles.snapReviewTitle}>{reviewHeaderTitle}</Text>
             <TouchableOpacity
-              onPress={() => router.back()}
+              onPress={onCloseReview}
               style={styles.reviewCloseBtn}
               hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}
             >
-              <ArcClose color="rgba(0,0,0,0.4)" />
+              <ArcClose color={Colors.textMuted} />
             </TouchableOpacity>
           </View>
-          <Text style={styles.snapReviewSubtitle}>
-            Check the details before these hit your closet.
-          </Text>
-          {(() => {
-            const nonIsolatedItems = aiMetaList.filter((i) => !i.isIsolated);
-            if (nonIsolatedItems.length === 0) return null;
-            const uris = [
-              ...new Set(
-                nonIsolatedItems
-                  .map((i) => i.sourceUri ?? image)
-                  .filter(Boolean),
-              ),
-            ] as string[];
-            if (uris.length <= 1) return null;
-            const parts = uris.map((u, i) => {
-              const c = nonIsolatedItems.filter(
-                (x) => (x.sourceUri ?? image) === u,
-              ).length;
-              return `Photo ${i + 1}: ${c} item${c === 1 ? "" : "s"}`;
-            });
-            return (
-              <Text style={styles.snapReviewMultiHint}>
-                {uris.length} photos — {parts.join(" · ")}
-              </Text>
-            );
-          })()}
+          {isOutfitExtractReview || reviewScanSubtitle ? (
+            <Text style={styles.snapReviewSubtitle}>
+              {isOutfitExtractReview
+                ? "Check the details before these hit your closet."
+                : reviewScanSubtitle}
+            </Text>
+          ) : null}
         </View>
 
+        {showScanGapSkeleton && aiMetaList.length === 0 ? (
+          <ReviewScanSkeletonCard />
+        ) : null}
+
         {aiMetaList.map((item, idx) => (
-          <Animated.View
-            key={`${item.sourceUri ?? image}-${idx}-${item.name ?? ""}-${item._displayEpoch ?? 0}`}
-            entering={FadeIn.duration(280)}
-          >
-            <View style={styles.snapItemCard}>
-              <TouchableOpacity
-                activeOpacity={0.88}
-                style={styles.snapItemMainPressable}
-                onPress={() =>
-                  !item._classifying && !item._enhancing && openUploadEdit(idx)
-                }
-              >
-                {item.isIsolated ? (
-                  <View style={styles.isolatedThumb}>
-                    <CrossfadeThumbImage
-                      uri={item.sourceUri}
-                      style={styles.isolatedThumbImg}
-                      resizeMode="contain"
-                      selfAspect
-                    />
-                    {item._classifying && (
-                      <View style={styles.classifyingBadge}>
-                        <ActivityIndicator
-                          color="rgba(0,0,0,0.35)"
-                          size="small"
-                        />
-                      </View>
-                    )}
-                  </View>
-                ) : (
-                  <ZoomedItemThumb
-                    uri={item.sourceUri ?? image!}
-                    box2d={item.isIsolated ? null : item.box_2d}
-                    width={130}
-                    resizeMode="cover"
-                    onPress={() => !item._classifying && openUploadEdit(idx)}
-                  />
-                )}
-                <View style={styles.snapItemMeta}>
-                  {!item._classifying && (
-                    <TouchableOpacity
-                      style={styles.snapItemTrashBtn}
-                      onPress={() => removeItem(idx)}
-                      hitSlop={{ top: 8, right: 8, bottom: 8, left: 8 }}
-                    >
-                      <IconTrashSmall />
-                    </TouchableOpacity>
-                  )}
-                  {item._classifying ? (
-                    <View style={styles.classifyingMeta}>
-                      <Text style={styles.classifyingLabel}>Classifying…</Text>
-                      <View style={styles.shimmerLine} />
-                      <View
-                        style={[
-                          styles.shimmerLine,
-                          { width: "55%", marginTop: 8 },
-                        ]}
-                      />
-                      <View
-                        style={[
-                          styles.shimmerLine,
-                          { width: "70%", marginTop: 8 },
-                        ]}
-                      />
-                    </View>
-                  ) : (
-                    <>
-                      <Text style={styles.snapItemName} numberOfLines={2}>
-                        {item?.name || "Unknown item"}
-                      </Text>
-                      <View style={styles.snapItemCatPill}>
-                        <Text style={styles.snapItemCatText}>
-                          {(
-                            item?.sub_category ||
-                            item?.type ||
-                            item?.category ||
-                            "Piece"
-                          ).toUpperCase()}
-                        </Text>
-                      </View>
-                      {item?.color ? (
-                        <View style={styles.snapItemColorRow}>
-                          <View
-                            style={[
-                              styles.snapColorDot,
-                              {
-                                backgroundColor: swatchForItemColor(
-                                  String(item.color),
-                                ),
-                              },
-                            ]}
-                          />
-                          <Text style={styles.snapItemColorText}>
-                            {item.color}
-                          </Text>
-                        </View>
-                      ) : null}
-                      {item?.occasions?.length > 0 ? (
-                        <View style={styles.snapItemOccRow}>
-                          {(item.occasions as string[])
-                            .slice(0, 4)
-                            .map((occ) => (
-                              <View key={occ} style={styles.snapItemOccChip}>
-                                <Text style={styles.snapItemOccChipText}>
-                                  {occ}
-                                </Text>
-                              </View>
-                            ))}
-                        </View>
-                      ) : null}
-                      {item?.warmth ? (
-                        <Text style={styles.snapItemSeasonLine}>
-                          {item.warmth === "warm"
-                            ? "☀️ Warm weather"
-                            : item.warmth === "cold"
-                              ? "❄️ Cold weather"
-                              : "🌤 All weather"}
-                        </Text>
-                      ) : null}
-                    </>
-                  )}
-                </View>
-              </TouchableOpacity>
-              {!item._classifying ? (
-                <View style={styles.snapItemActionsBar}>
-                  <View style={styles.snapItemActionsRow}>
-                    <TouchableOpacity
-                      style={[
-                        styles.snapEnhanceBtn,
-                        item._enhancing && styles.snapEnhanceBtnDisabled,
-                      ]}
-                      onPress={() => enhanceItemAtIndex(idx)}
-                      disabled={!!item._enhancing}
-                      activeOpacity={0.88}
-                    >
-                      {item._enhancing ? (
-                        <ActivityIndicator color={Colors.accent} size="small" />
-                      ) : (
-                        <Text style={styles.snapEnhanceBtnText}>Enhance</Text>
-                      )}
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={styles.snapConfigureBtn}
-                      onPress={() => openUploadEdit(idx)}
-                    >
-                      <Text style={styles.snapConfigureBtnText}>Configure</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              ) : null}
-            </View>
-          </Animated.View>
+          <View key={reviewItemRowKey(item, idx, fallbackPhotoUri)}>
+            <ReviewScanItemRow
+              item={item}
+              idx={idx}
+              onRemoveAt={onRemoveAt}
+              onConfigureAt={onConfigureAt}
+              onEnhanceAt={onEnhanceAt}
+              onAdjustAt={onAdjustAt}
+            />
+          </View>
         ))}
 
-        {batchAnalyze && batchAnalyze.total > 0 ? (
+        {showScanGapSkeleton && aiMetaList.length > 0 ? (
+          <ReviewScanSkeletonCard />
+        ) : null}
+
+        {showReviewAppendLoading && batchAnalyze ? (
           <View style={styles.reviewAppendLoading}>
             <ActivityIndicator color={Colors.accent} size="small" />
             <Text style={styles.reviewAppendLoadingText}>
-              {`Adding items… ${batchAnalyze.current} of ${batchAnalyze.total} done`}
+              {aiMetaList.length > 0
+                ? `${aiMetaList.length} found · scanning photo ${Math.min(batchAnalyze.current + 1, batchAnalyze.total)} of ${batchAnalyze.total}…`
+                : `Looking for pieces · photo ${Math.min(batchAnalyze.current + 1, batchAnalyze.total)} of ${batchAnalyze.total}`}
             </Text>
           </View>
         ) : null}
 
-        {aiMetaList.length === 0 ? (
+        {aiMetaList.length === 0 && !reviewScanActive ? (
           <View style={styles.emptyState}>
             <Text style={styles.emptyStateText}>
               No items matched your scan.
@@ -2614,41 +5997,124 @@ export default function AddScreen() {
         ) : null}
       </>
     );
-  };
+  }
+
+  const showAppendCameraCapture =
+    status === "scanning" &&
+    uploadSource === "camera" &&
+    !isOutfitMode &&
+    !isExtractForOutfitMode;
+  const showOutfitCameraCapture =
+    status === "scanning" &&
+    uploadSource === "camera" &&
+    isOutfitMode &&
+    !isExtractForOutfitMode;
+  const showScanOrIsolateShell =
+    status === "outfit_isolating" ||
+    status === "outfit_processing" ||
+    showAppendCameraCapture ||
+    (status === "scanning" && !image) ||
+    (status === "analyzing" && aiMetaList.length === 0 && !image) ||
+    (status === "review" && isOutfitMode && !isExtractForOutfitMode);
+  const showLibraryPassThrough =
+    !showAppendCameraCapture &&
+    !showOutfitCameraCapture &&
+    (uploadSource === "library" ||
+      status === "outfit_isolating" ||
+      status === "outfit_processing" ||
+      isOutfitMode ||
+      (status === "scanning" && !!image));
 
   return (
     <GestureHandlerRootView style={styles.container}>
-      {status === "scanning" || status === "analyzing" ? (
-        uploadSource === "library" ? (
+      {showScanOrIsolateShell ? (
+        showLibraryPassThrough ? (
           <View style={styles.libraryPassThrough}>
-            {(status === "analyzing" || status === "scanning") && (
-              <View style={[styles.analyzingSheet, { paddingTop: insets.top }]}>
+            {!libraryAutoPickPending &&
+              !libraryPickerOpen &&
+              (status === "analyzing" ||
+                status === "scanning" ||
+                status === "outfit_isolating" ||
+                status === "outfit_processing" ||
+                (status === "review" &&
+                  isOutfitMode &&
+                  !isExtractForOutfitMode)) && (
+              <View
+                style={[
+                  styles.analyzingSheet,
+                  { paddingTop: insets.top },
+                  (status === "outfit_isolating" ||
+                    status === "outfit_processing") &&
+                    styles.outfitIsolateSheet,
+                  status === "review" &&
+                    isOutfitMode &&
+                    !isExtractForOutfitMode &&
+                    styles.outfitIsolateSheet,
+                ]}
+              >
                 <View style={styles.analyzingSheetBody}>
-                  <ActivityIndicator color={Colors.accent} size="large" />
-                  <Text style={styles.analyzingTitle}>
-                    {status === "scanning"
-                      ? "Opening photos…"
-                      : batchAnalyze && batchAnalyze.total > 1
-                        ? `Analyzing ${batchAnalyze.total} photos…`
-                        : "Extracting items…"}
-                  </Text>
-                  {status === "analyzing" && batchAnalyze && batchAnalyze.total > 1 ? (
-                    <Text style={styles.analyzingSub}>
-                      Detecting every item in each photo.
-                    </Text>
-                  ) : null}
+                  {status === "outfit_isolating" ||
+                  status === "outfit_processing" ||
+                  (status === "review" &&
+                    isOutfitMode &&
+                    !isExtractForOutfitMode) ? (
+                    <View style={styles.outfitIsolateCopy}>
+                      <Text style={styles.outfitIsolateHeadline}>
+                        <Text style={styles.outfitIsolateHeadStrong}>
+                          {status === "outfit_processing" ||
+                          (status === "review" && isOutfitMode)
+                            ? "PREPARING "
+                            : "REMOVING "}
+                        </Text>
+                        <Text style={styles.outfitIsolateHeadSoft}>
+                          {status === "outfit_processing" ||
+                          (status === "review" && isOutfitMode)
+                            ? "YOUR LOOKS"
+                            : "BACKGROUND"}
+                        </Text>
+                      </Text>
+                      <Text style={styles.outfitIsolateSub}>
+                        {batchAnalyze && batchAnalyze.total > 1
+                          ? `Look ${batchAnalyze.current} of ${batchAnalyze.total} — cutting you out for your library.`
+                          : "Cutting you out like the main character you are. Stay on the app for a sec."}
+                      </Text>
+                      {status === "outfit_processing" ||
+                      (status === "review" && isOutfitMode) ? (
+                        <ActivityIndicator
+                          color={Colors.accent}
+                          size="large"
+                          style={{ marginTop: 16 }}
+                        />
+                      ) : null}
+                    </View>
+                  ) : (
+                    <>
+                      <ActivityIndicator color={Colors.accent} size="large" />
+                      <Text style={styles.analyzingTitle}>
+                        {status === "scanning"
+                          ? "Opening photos…"
+                          : isOutfitMode
+                            ? "Preparing your look…"
+                            : batchAnalyze && batchAnalyze.total > 1
+                              ? `Analyzing ${batchAnalyze.total} photos…`
+                              : "Extracting items…"}
+                      </Text>
+                      {status === "analyzing" &&
+                      batchAnalyze &&
+                      batchAnalyze.total > 1 ? (
+                        <Text style={styles.analyzingSub}>
+                          Detecting every item in each photo.
+                        </Text>
+                      ) : null}
+                    </>
+                  )}
                 </View>
               </View>
             )}
           </View>
         ) : (
           <View style={styles.cameraWrapper}>
-            <View
-              style={[
-                styles.cameraViewport,
-                { top: insets.top + 10 },
-              ]}
-            >
+            <View style={[styles.cameraViewport, { top: insets.top + 10 }]}>
               {permission.granted ? (
                 <GestureDetector gesture={cameraPinchGesture}>
                   <View style={StyleSheet.absoluteFill}>
@@ -2683,7 +6149,7 @@ export default function AddScreen() {
             >
               <View style={styles.hudHeader}>
                 <TouchableOpacity
-                  onPress={() => router.back()}
+                  onPress={closeCamera}
                   style={styles.hudGhostBtn}
                 >
                   <ArcClose color="#fff" />
@@ -2691,8 +6157,12 @@ export default function AddScreen() {
 
                 <View style={styles.hudHeaderLabel}>
                   <Text style={styles.hudHeaderTitle}>Camera</Text>
-                  <Text style={styles.hudHeaderSub} numberOfLines={1}>
-                    Individual pieces or whole outfits
+                  <Text style={styles.hudHeaderSub} numberOfLines={2}>
+                    {isOutfitMode
+                      ? capturedPhotos.length > 1
+                        ? "Each capture becomes one look — Done reviews them in order"
+                        : "One full look — saved to Fits"
+                      : "Individual pieces or whole outfits"}
                   </Text>
                 </View>
 
@@ -2703,7 +6173,7 @@ export default function AddScreen() {
                   ]}
                   onPress={() =>
                     setFlash((f) =>
-                      f === "off" ? "on" : f === "on" ? "torch" : "off",
+                      f === "off" ? "on" : f === "on" ? "auto" : "off",
                     )
                   }
                 >
@@ -2802,11 +6272,14 @@ export default function AddScreen() {
         <View
           style={[
             styles.reviewWrapper,
-            status === "review" && styles.reviewWrapperHost,
-            status === "review" && image && styles.reviewBackdropHost,
+            (status === "review" || status === "analyzing") &&
+              styles.reviewWrapperHost,
+            (status === "review" || status === "analyzing") &&
+              image &&
+              styles.reviewBackdropHost,
           ]}
         >
-          {status === "review" && (
+          {(status === "review" || status === "analyzing") && (
             <>
               <Modal
                 visible={editIndex !== null}
@@ -2831,103 +6304,18 @@ export default function AddScreen() {
                       setPreviewUri(null);
                     }}
                   />
-                  <ScrollView
-                    style={styles.uploadEditCard}
-                    contentContainerStyle={{ paddingBottom: 32 }}
-                    showsVerticalScrollIndicator={false}
+                  <View
+                    style={[
+                      styles.uploadEditCard,
+                      { paddingBottom: Math.max(insets.bottom, 16) },
+                    ]}
                   >
-                    {editIndex !== null && aiMetaList[editIndex]?.sourceUri
-                      ? (() => {
-                          const editItem = aiMetaList[editIndex];
-                          const hasOrig = !!editItem?.originalSourceUri;
-                          const thumbW = width - 48;
-                          return (
-                            <View style={styles.uploadEditItemThumb}>
-                              <GHScrollView
-                                horizontal
-                                pagingEnabled
-                                nestedScrollEnabled
-                                keyboardShouldPersistTaps="handled"
-                                showsHorizontalScrollIndicator={false}
-                                scrollEnabled={hasOrig}
-                                onScroll={(e) => {
-                                  const page = Math.round(
-                                    e.nativeEvent.contentOffset.x / thumbW,
-                                  );
-                                  setConfigCarouselPage(page);
-                                }}
-                                scrollEventThrottle={16}
-                                style={{ flex: 1 }}
-                              >
-                                <GHTouchableOpacity
-                                  activeOpacity={0.92}
-                                  style={{ width: thumbW }}
-                                  onPress={() => {
-                                    void Haptics.impactAsync(
-                                      Haptics.ImpactFeedbackStyle.Light,
-                                    );
-                                    setPreviewUri(editItem.sourceUri);
-                                  }}
-                                >
-                                  <Image
-                                    source={{ uri: editItem.sourceUri }}
-                                    style={[
-                                      styles.uploadEditItemThumbImg,
-                                      { width: thumbW },
-                                    ]}
-                                    resizeMode="contain"
-                                  />
-                                </GHTouchableOpacity>
-                                {hasOrig && (
-                                  <GHTouchableOpacity
-                                    activeOpacity={0.92}
-                                    style={{ width: thumbW }}
-                                    onPress={() => {
-                                      void Haptics.impactAsync(
-                                        Haptics.ImpactFeedbackStyle.Light,
-                                      );
-                                      if (editItem.originalSourceUri) {
-                                        setPreviewUri(
-                                          editItem.originalSourceUri,
-                                        );
-                                      }
-                                    }}
-                                  >
-                                    <Image
-                                      source={{
-                                        uri: editItem.originalSourceUri,
-                                      }}
-                                      style={[
-                                        styles.uploadEditItemThumbImg,
-                                        { width: thumbW },
-                                      ]}
-                                      resizeMode="contain"
-                                    />
-                                  </GHTouchableOpacity>
-                                )}
-                              </GHScrollView>
-                              {hasOrig && (
-                                <View style={styles.carouselDots}>
-                                  <View
-                                    style={[
-                                      styles.carouselDot,
-                                      configCarouselPage === 0 &&
-                                        styles.carouselDotActive,
-                                    ]}
-                                  />
-                                  <View
-                                    style={[
-                                      styles.carouselDot,
-                                      configCarouselPage === 1 &&
-                                        styles.carouselDotActive,
-                                    ]}
-                                  />
-                                </View>
-                              )}
-                            </View>
-                          );
-                        })()
-                      : null}
+                    <ScrollView
+                      contentContainerStyle={styles.uploadEditScrollContent}
+                      showsVerticalScrollIndicator={false}
+                      keyboardShouldPersistTaps="handled"
+                      automaticallyAdjustKeyboardInsets
+                    >
                     <View style={styles.uploadEditHeader}>
                       <Text style={styles.uploadEditTitle}>Configure</Text>
                       <TouchableOpacity
@@ -2938,7 +6326,7 @@ export default function AddScreen() {
                         hitSlop={{ top: 10, right: 10, bottom: 10, left: 10 }}
                         style={styles.uploadEditCloseBtn}
                       >
-                        <ArcClose color="rgba(0,0,0,0.4)" />
+                        <ArcClose color={Colors.textMuted} />
                       </TouchableOpacity>
                     </View>
 
@@ -2992,20 +6380,15 @@ export default function AddScreen() {
                       onPress={() => setUploadColorPickerOpen(true)}
                       activeOpacity={0.88}
                     >
-                      <ColorPickerTriggerIcon size={40} />
-                      <View style={{ flex: 1, minWidth: 0 }}>
-                        <Text
-                          style={styles.uploadColorTriggerTitle}
-                          numberOfLines={1}
-                        >
-                          {editForm.color?.trim()
-                            ? editForm.color
-                            : "Choose color"}
-                        </Text>
-                        <Text style={styles.uploadColorTriggerSub}>
-                          Grid, spectrum, or sliders
-                        </Text>
-                      </View>
+                      <ColorPickerTriggerIcon size={32} />
+                      <Text
+                        style={styles.uploadColorTriggerTitle}
+                        numberOfLines={1}
+                      >
+                        {editForm.color?.trim()
+                          ? editForm.color
+                          : "Choose color"}
+                      </Text>
                     </TouchableOpacity>
 
                     <Text style={styles.uploadEditLabel}>Occasions</Text>
@@ -3046,36 +6429,6 @@ export default function AddScreen() {
                         );
                       })}
                     </View>
-                    <TextInput
-                      style={[styles.uploadEditInput, { marginTop: -12 }]}
-                      value={
-                        editForm.occasions
-                          .filter(
-                            (o) =>
-                              !OCCASIONS_FLAT.some(
-                                (f) => f.id.toLowerCase() === o.toLowerCase(),
-                              ),
-                          )
-                          .join(", ") || ""
-                      }
-                      onChangeText={(t) => {
-                        const known = editForm.occasions.filter((o) =>
-                          OCCASIONS_FLAT.some(
-                            (f) => f.id.toLowerCase() === o.toLowerCase(),
-                          ),
-                        );
-                        const custom = t
-                          .split(",")
-                          .map((s) => s.trim())
-                          .filter(Boolean);
-                        setEditForm((prev) => ({
-                          ...prev,
-                          occasions: [...known, ...custom],
-                        }));
-                      }}
-                      placeholder="Custom occasions (comma separated)"
-                      placeholderTextColor={Colors.textMuted}
-                    />
 
                     <Text style={styles.uploadEditLabel}>Weather</Text>
                     <View style={styles.uploadEditChipRow}>
@@ -3146,15 +6499,12 @@ export default function AddScreen() {
                         <Text style={styles.uploadEditSaveText}>Save</Text>
                       </TouchableOpacity>
                     </View>
-                  </ScrollView>
+                    </ScrollView>
+                  </View>
 
                   {/* Nested Modal often fails on Android/iOS while Configure is open — overlay inside this Modal instead */}
                   {previewUri !== null && editIndex !== null
                     ? (() => {
-                        const pe = aiMetaList[editIndex];
-                        const orig = pe?.originalSourceUri;
-                        const hasDual =
-                          !!orig && !!pe?.sourceUri && orig !== pe.sourceUri;
                         const bgLight = previewUri.startsWith("data:");
                         return (
                           <View
@@ -3167,106 +6517,25 @@ export default function AddScreen() {
                             <GestureHandlerRootView
                               style={StyleSheet.absoluteFill}
                             >
-                              {hasDual ? (
-                                <View
-                                  style={[
-                                    StyleSheet.absoluteFill,
-                                    {
-                                      backgroundColor: bgLight
-                                        ? "#FFFFFF"
-                                        : "#000",
-                                    },
-                                  ]}
-                                >
-                                  <GHScrollView
-                                    ref={previewFullscreenScrollRef}
-                                    horizontal
-                                    pagingEnabled
-                                    nestedScrollEnabled
-                                    keyboardShouldPersistTaps="handled"
-                                    showsHorizontalScrollIndicator={false}
-                                    style={{ flex: 1 }}
-                                    onScroll={(e) => {
-                                      const p = Math.round(
-                                        e.nativeEvent.contentOffset.x / width,
-                                      );
-                                      setPreviewFullscreenPage(p);
-                                    }}
-                                    scrollEventThrottle={16}
-                                  >
-                                    <View
-                                      style={{ width, height: windowHeight }}
-                                    >
-                                      <Image
-                                        source={{ uri: pe.sourceUri }}
-                                        style={{ width, height: windowHeight }}
-                                        resizeMode="contain"
-                                      />
-                                    </View>
-                                    <View
-                                      style={{ width, height: windowHeight }}
-                                    >
-                                      <Image
-                                        source={{ uri: orig }}
-                                        style={{ width, height: windowHeight }}
-                                        resizeMode="contain"
-                                      />
-                                    </View>
-                                  </GHScrollView>
-                                  <View
-                                    style={styles.fullscreenPagerDots}
-                                    pointerEvents="none"
-                                  >
-                                    <View
-                                      style={[
-                                        styles.fullscreenPagerDot,
-                                        previewFullscreenPage === 0 &&
-                                          styles.fullscreenPagerDotActive,
-                                      ]}
-                                    />
-                                    <View
-                                      style={[
-                                        styles.fullscreenPagerDot,
-                                        previewFullscreenPage === 1 &&
-                                          styles.fullscreenPagerDotActive,
-                                      ]}
-                                    />
-                                  </View>
-                                  <TouchableOpacity
-                                    style={[
-                                      styles.fullscreenPagerClose,
-                                      { top: insets.top + 10 },
-                                    ]}
-                                    onPress={() => setPreviewUri(null)}
-                                    hitSlop={12}
-                                    activeOpacity={0.85}
-                                    accessibilityLabel="Close preview"
-                                  >
-                                    <View
-                                      style={styles.fullscreenPagerCloseInner}
-                                    >
-                                      <ArcClose color="#FFF" />
-                                    </View>
-                                  </TouchableOpacity>
-                                </View>
-                              ) : (
-                                <TouchableOpacity
-                                  activeOpacity={1}
-                                  style={[
-                                    StyleSheet.absoluteFill,
-                                    bgLight
-                                      ? { backgroundColor: "#FFFFFF" }
-                                      : { backgroundColor: "#000" },
-                                  ]}
-                                  onPress={() => setPreviewUri(null)}
-                                >
-                                  <Image
-                                    source={{ uri: previewUri }}
-                                    style={{ width, height: windowHeight }}
-                                    resizeMode="contain"
-                                  />
-                                </TouchableOpacity>
-                              )}
+                              <TouchableOpacity
+                                activeOpacity={1}
+                                style={[
+                                  StyleSheet.absoluteFill,
+                                  bgLight
+                                    ? { backgroundColor: Colors.imageLetterbox }
+                                    : { backgroundColor: "#000" },
+                                ]}
+                                onPress={() => setPreviewUri(null)}
+                              >
+                                <Image
+                                  source={{ uri: previewUri }}
+                                  style={{
+                                    width: windowWidth,
+                                    height: windowHeight,
+                                  }}
+                                  resizeMode="contain"
+                                />
+                              </TouchableOpacity>
                             </GestureHandlerRootView>
                           </View>
                         );
@@ -3287,7 +6556,7 @@ export default function AddScreen() {
                   style={[
                     styles.fullscreenBackdrop,
                     previewUri?.startsWith("data:") && {
-                      backgroundColor: "#FFFFFF",
+                      backgroundColor: Colors.imageLetterbox,
                     },
                   ]}
                   onPress={() => setPreviewUri(null)}
@@ -3313,12 +6582,13 @@ export default function AddScreen() {
             </>
           )}
 
-          {status === "review" && image ? (
+          {(status === "review" || status === "analyzing") && image ? (
             <View style={[styles.reviewSheet, { top: insets.top }]}>
               <View style={styles.reviewSheetHandleArea}>
                 <View style={styles.dragHandle} />
               </View>
               <ScrollView
+                ref={reviewScrollRef}
                 style={styles.reviewSheetScroll}
                 contentContainerStyle={[
                   styles.scrollContent,
@@ -3345,17 +6615,18 @@ export default function AddScreen() {
                 <TouchableOpacity
                   style={[
                     styles.reviewStickyPrimary,
-                    (!aiMetaList.length || uploading) &&
-                      styles.reviewStickyPrimaryDisabled,
+                    reviewSaveBlocked && styles.reviewStickyPrimaryDisabled,
                   ]}
                   onPress={handleAddToCloset}
-                  disabled={!aiMetaList.length || uploading}
+                  disabled={reviewSaveBlocked}
                 >
                   {uploading ? (
-                    <ActivityIndicator color="#fff" />
+                    <ActivityIndicator color={Colors.white} />
                   ) : (
                     <Text style={styles.reviewStickyPrimaryText}>
-                      Save to closet
+                      {activeLinkOutfitId
+                        ? "Save & attach to look"
+                        : "Save to closet"}
                     </Text>
                   )}
                 </TouchableOpacity>
@@ -3431,7 +6702,7 @@ export default function AddScreen() {
                 ) : null}
               </ScrollView>
 
-              {status === "review" && !image ? (
+              {(status === "review" || status === "analyzing") && !image ? (
                 <>
                   <View
                     style={[
@@ -3451,17 +6722,18 @@ export default function AddScreen() {
                     <TouchableOpacity
                       style={[
                         styles.reviewStickyPrimary,
-                        (!aiMetaList.length || uploading) &&
-                          styles.reviewStickyPrimaryDisabled,
+                        reviewSaveBlocked && styles.reviewStickyPrimaryDisabled,
                       ]}
                       onPress={handleAddToCloset}
-                      disabled={!aiMetaList.length || uploading}
+                      disabled={reviewSaveBlocked}
                     >
                       {uploading ? (
-                        <ActivityIndicator color="#fff" />
+                        <ActivityIndicator color={Colors.white} />
                       ) : (
                         <Text style={styles.reviewStickyPrimaryText}>
-                          Save to closet
+                          {activeLinkOutfitId
+                            ? "Save & attach to look"
+                            : "Save to closet"}
                         </Text>
                       )}
                     </TouchableOpacity>
@@ -3471,7 +6743,9 @@ export default function AddScreen() {
             </>
           )}
 
-          {(status === "review" || status === "done") && (
+          {(status === "review" ||
+            status === "analyzing" ||
+            status === "done") && (
             <Modal
               visible={addMoreSheetOpen}
               transparent
@@ -3503,7 +6777,7 @@ export default function AddScreen() {
                         width="18"
                         height="13"
                         rx="2"
-                        stroke="#000"
+                        stroke={Colors.text}
                         strokeWidth="2"
                         fill="none"
                       />
@@ -3511,13 +6785,13 @@ export default function AddScreen() {
                         cx="12"
                         cy="13"
                         r="3.5"
-                        stroke="#000"
+                        stroke={Colors.text}
                         strokeWidth="1.8"
                         fill="none"
                       />
                       <Path
                         d="M9 6l1.5-2h3L15 6"
-                        stroke="#000"
+                        stroke={Colors.text}
                         strokeWidth="1.8"
                         strokeLinecap="round"
                         fill="none"
@@ -3543,14 +6817,14 @@ export default function AddScreen() {
                         width="18"
                         height="18"
                         rx="3"
-                        stroke="#000"
+                        stroke={Colors.text}
                         strokeWidth="2"
                         fill="none"
                       />
-                      <Circle cx="8.5" cy="8.5" r="1.5" fill="#000" />
+                      <Circle cx="8.5" cy="8.5" r="1.5" fill={Colors.text} />
                       <Path
                         d="M21 15L16 10L5 21"
-                        stroke="#000"
+                        stroke={Colors.text}
                         strokeWidth="2"
                         strokeLinecap="round"
                         fill="none"
@@ -3569,6 +6843,27 @@ export default function AddScreen() {
           )}
         </View>
       )}
+
+      <ManualCropModal
+        visible={manualCropIndex !== null}
+        imageUri={
+          manualCropIndex !== null
+            ? (aiMetaList[manualCropIndex]?.originalSourceUri ??
+              aiMetaList[manualCropIndex]?.sourceUri ??
+              image ??
+              null)
+            : null
+        }
+        initialBox={
+          manualCropIndex !== null
+            ? Array.isArray(aiMetaList[manualCropIndex]?.box_2d)
+              ? (aiMetaList[manualCropIndex]?.box_2d as number[])
+              : null
+            : null
+        }
+        onCancel={() => setManualCropIndex(null)}
+        onSave={handleManualCropSave}
+      />
     </GestureHandlerRootView>
   );
 }
@@ -3576,30 +6871,147 @@ export default function AddScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
   },
   permissionScreen: {
     flex: 1,
-    justifyContent: "center",
+    backgroundColor: Colors.homeHeroBackdrop,
+  },
+  permissionTopBar: {
+    height: 48,
+    paddingHorizontal: 16,
+    flexDirection: "row",
     alignItems: "center",
-    padding: 40,
-    gap: 32,
-    backgroundColor: Colors.bg,
+    justifyContent: "space-between",
+  },
+  permissionCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.glassFill,
+    borderWidth: 1,
+    borderColor: Editorial.cardBorderSubtle,
+  },
+  permissionTopTitle: {
+    fontFamily: Fonts.bold,
+    fontSize: 15,
+    color: Colors.text,
+    letterSpacing: -0.25,
+  },
+  permissionTopSpacer: {
+    width: 36,
+  },
+  permissionScroll: {
+    flex: 1,
+  },
+  permissionScrollContent: {
+    paddingHorizontal: 24,
+    paddingTop: 22,
+    paddingBottom: 20,
+    alignItems: "stretch",
   },
   permTitle: {
-    fontSize: 28,
-    fontWeight: "800",
+    fontFamily: Fonts.extrabold,
+    fontSize: 32,
+    lineHeight: 36,
+    letterSpacing: -1.2,
     color: Colors.text,
-    textAlign: "center",
   },
   permSub: {
-    fontSize: 16,
+    marginTop: 12,
+    fontFamily: Fonts.medium,
+    fontSize: 15,
+    lineHeight: 22,
     color: Colors.textMuted,
+    maxWidth: 320,
+  },
+  permCard: {
+    marginTop: 28,
+    borderRadius: Editorial.cardRadius,
+    backgroundColor: Editorial.cardBg,
+    borderWidth: 1,
+    borderColor: Editorial.cardBorderSubtle,
+    overflow: "hidden",
+  },
+  permRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    paddingVertical: 15,
+    paddingHorizontal: 15,
+  },
+  permRowIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.surfaceElevated,
+    borderWidth: 1,
+    borderColor: Editorial.cardBorderSubtle,
+  },
+  permRowText: {
+    flex: 1,
+  },
+  permRowTitle: {
+    fontFamily: Fonts.bold,
+    fontSize: 15,
+    color: Colors.text,
+    letterSpacing: -0.2,
+  },
+  permRowSub: {
+    marginTop: 2,
+    fontFamily: Fonts.medium,
+    fontSize: 13,
+    lineHeight: 18,
+    color: Colors.textMuted,
+  },
+  permDivider: {
+    height: StyleSheet.hairlineWidth,
+    marginLeft: 15 + 40 + 14,
+    backgroundColor: Colors.border,
+  },
+  permissionFooter: {
+    paddingHorizontal: 22,
+    paddingTop: 10,
+    gap: 9,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: Colors.border,
+  },
+  permissionPrimaryBtn: {
+    height: 54,
+    borderRadius: Radii.full,
+    paddingHorizontal: 18,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 9,
+    backgroundColor: Colors.accent,
+  },
+  permissionPrimaryText: {
+    flex: 1,
+    fontFamily: Fonts.bold,
+    fontSize: 15,
+    color: Colors.white,
     textAlign: "center",
+  },
+  permissionSecondaryBtn: {
+    height: 44,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  permissionSecondaryText: {
+    fontFamily: Fonts.bold,
+    fontSize: 14,
+    color: Colors.text,
   },
   cameraWrapper: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
   },
   cameraViewport: {
     position: "absolute",
@@ -3612,15 +7024,43 @@ const styles = StyleSheet.create({
     backgroundColor: "#000",
   },
   cameraRollPlaceholder: {
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
   },
   libraryPassThrough: {
     flex: 1,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
+  },
+  outfitIsolateSheet: {
+    backgroundColor: Colors.surface,
+  },
+  outfitIsolateCopy: {
+    alignItems: "center",
+    gap: 14,
+    paddingHorizontal: 28,
+    maxWidth: 340,
+  },
+  outfitIsolateHeadline: {
+    fontSize: 14,
+    fontWeight: "700",
+    letterSpacing: 1.6,
+    textAlign: "center",
+  },
+  outfitIsolateHeadStrong: {
+    color: Colors.text,
+  },
+  outfitIsolateHeadSoft: {
+    color: Colors.textMuted,
+  },
+  outfitIsolateSub: {
+    fontSize: 15,
+    fontWeight: "500",
+    lineHeight: 22,
+    textAlign: "center",
+    color: Colors.textMuted,
   },
   analyzingSheet: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
     justifyContent: "center",
   },
   analyzingSheetBody: {
@@ -3643,7 +7083,7 @@ const styles = StyleSheet.create({
   },
   libraryOnlyRoot: {
     flex: 1,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
   },
   libraryOnlyHeader: {
     flexDirection: "row",
@@ -3853,7 +7293,7 @@ const styles = StyleSheet.create({
   },
   reviewWrapper: {
     flex: 1,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.homeHeroBackdrop,
   },
   reviewWrapperHost: {
     flex: 1,
@@ -3877,7 +7317,9 @@ const styles = StyleSheet.create({
     bottom: 0,
     zIndex: 1,
     flexDirection: "column",
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.navBarFillOnWarm,
+    borderTopWidth: 1,
+    borderTopColor: Colors.border,
   },
   reviewSheetHandleArea: {
     paddingTop: 10,
@@ -3936,7 +7378,7 @@ const styles = StyleSheet.create({
     width: 40,
     height: 5,
     borderRadius: 3,
-    backgroundColor: "rgba(0,0,0,0.12)",
+    backgroundColor: Colors.borderStrong,
     alignSelf: "center",
     marginBottom: 12,
   },
@@ -3950,9 +7392,11 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: "rgba(0,0,0,0.06)",
+    backgroundColor: Editorial.ghostBg,
     alignItems: "center",
     justifyContent: "center",
+    borderWidth: 1,
+    borderColor: Editorial.ghostBorder,
   },
   snapReviewHeader: {
     paddingHorizontal: 24,
@@ -3972,23 +7416,16 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
-  snapReviewMultiHint: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: Colors.accent,
-    textAlign: "center",
-    marginTop: 10,
-  },
   isolatedThumb: {
     width: 140,
     alignSelf: "center", // shrinks to image height so card hugs the garment with no bands
-    backgroundColor: "#F5F1EC", // warm neutral — matches competitor's non-white card tone
+    backgroundColor: Colors.imageLetterbox,
     justifyContent: "center",
     alignItems: "center",
     borderRadius: 16,
     overflow: "hidden",
     borderRightWidth: 1,
-    borderRightColor: "rgba(0,0,0,0.05)",
+    borderRightColor: Colors.border,
   },
   isolatedThumbImg: {
     width: "100%",
@@ -4000,6 +7437,12 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
+  enhanceThumbOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.55)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
   classifyingBadge: {
     position: "absolute",
     bottom: 8,
@@ -4007,22 +7450,23 @@ const styles = StyleSheet.create({
     width: 28,
     height: 28,
     borderRadius: 14,
-    backgroundColor: "rgba(255,255,255,0.92)",
+    backgroundColor: Colors.surfaceElevated,
     justifyContent: "center",
     alignItems: "center",
-    shadowColor: "#000",
+    shadowColor: Colors.accentDark,
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.1,
     shadowRadius: 3,
   },
   classifyingMeta: {
     flex: 1,
-    paddingTop: 8,
+    paddingTop: 4,
+    minHeight: REVIEW_ITEM_META_MIN_HEIGHT,
   },
   classifyingLabel: {
     fontSize: 11,
     fontWeight: "600",
-    color: "rgba(0,0,0,0.35)",
+    color: Colors.textMuted,
     letterSpacing: 0.3,
     marginBottom: 10,
   },
@@ -4030,48 +7474,60 @@ const styles = StyleSheet.create({
     height: 14,
     width: "80%",
     borderRadius: 7,
-    backgroundColor: "rgba(0,0,0,0.07)",
+    backgroundColor: Colors.surfaceInset,
+  },
+  scanSkeletonBlock: {
+    backgroundColor: Colors.surfaceInset,
   },
   snapItemCard: {
-    marginHorizontal: 20,
-    marginBottom: 14,
-    backgroundColor: "#fff",
-    borderRadius: 20,
+    marginHorizontal: 16,
+    marginBottom: 12,
+    backgroundColor: Editorial.cardBg,
+    borderRadius: Editorial.cardRadius,
     flexDirection: "column",
     overflow: "hidden",
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.06)",
-    minHeight: 180,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.08,
-    shadowRadius: 12,
-    elevation: 4,
+    borderColor: Editorial.cardBorderSubtle,
+    minHeight: 212,
+    shadowColor: Colors.accentDark,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    elevation: 3,
   },
   snapItemMainPressable: {
     flexDirection: "row",
-    minHeight: 180,
+    minHeight: 160,
     flex: 1,
   },
   snapItemActionsBar: {
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "rgba(0,0,0,0.08)",
-    paddingHorizontal: 14,
-    paddingTop: 8,
-    paddingBottom: 12,
+    borderTopColor: Colors.border,
+    paddingHorizontal: 12,
+    paddingTop: 6,
+    paddingBottom: 10,
     alignItems: "flex-end",
-    backgroundColor: "#fff",
+    backgroundColor: Editorial.cardBgMuted,
   },
   snapItemThumb: {
-    width: 130,
+    width: 138,
     height: 160,
-    backgroundColor: Colors.imageLetterbox,
+    backgroundColor: Colors.homeHeroBackdrop,
+    overflow: "hidden",
+  },
+  snapItemThumbInner: {
+    width: 138,
+    height: 160,
   },
   snapItemMeta: {
     flex: 1,
-    padding: 14,
+    padding: 12,
     flexDirection: "column",
-    overflow: "hidden",
+    minHeight: REVIEW_ITEM_META_MIN_HEIGHT,
+  },
+  snapItemMetaBody: {
+    flex: 1,
+    minHeight: REVIEW_ITEM_META_MIN_HEIGHT - 24,
   },
   snapItemTrashBtn: {
     position: "absolute",
@@ -4080,27 +7536,30 @@ const styles = StyleSheet.create({
     zIndex: 1,
   },
   snapItemName: {
-    fontSize: 17,
+    fontSize: 15,
     fontWeight: "800",
-    color: "#000",
-    marginTop: 2,
-    marginBottom: 8,
+    color: Colors.text,
+    marginTop: 0,
+    marginBottom: 6,
     paddingRight: 28,
-    lineHeight: 22,
+    lineHeight: 20,
+    flexShrink: 1,
   },
   snapItemCatPill: {
     alignSelf: "flex-start",
-    backgroundColor: "rgba(0,0,0,0.06)",
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    marginBottom: 10,
+    backgroundColor: Editorial.chipBg,
+    borderRadius: 5,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: Editorial.chipBorder,
   },
   snapItemCatText: {
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: "800",
-    color: "rgba(0,0,0,0.45)",
-    letterSpacing: 0.8,
+    color: Colors.textMuted,
+    letterSpacing: 0.6,
   },
   snapItemColorRow: {
     flexDirection: "row",
@@ -4113,12 +7572,12 @@ const styles = StyleSheet.create({
     height: 16,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.12)",
+    borderColor: Colors.borderStrong,
   },
   snapItemColorText: {
     fontSize: 13,
     fontWeight: "600",
-    color: "rgba(0,0,0,0.55)",
+    color: Colors.textLight,
     textTransform: "capitalize",
   },
   snapItemOccRow: {
@@ -4128,23 +7587,40 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   snapItemOccChip: {
-    backgroundColor: "rgba(0,0,0,0.05)",
+    backgroundColor: Editorial.ghostBg,
     borderRadius: 6,
     paddingHorizontal: 8,
     paddingVertical: 3,
+    borderWidth: 1,
+    borderColor: Editorial.ghostBorder,
   },
   snapItemOccChipText: {
     fontSize: 11,
     fontWeight: "600",
-    color: "rgba(0,0,0,0.4)",
+    color: Colors.textMuted,
     textTransform: "capitalize",
   },
   snapItemSeasonLine: {
     fontSize: 11,
     fontWeight: "600",
-    color: "rgba(0,0,0,0.38)",
+    color: Colors.textMuted,
     marginTop: 4,
     textTransform: "capitalize",
+  },
+  snapItemLowConfidenceChip: {
+    alignSelf: "flex-start",
+    marginTop: 6,
+    backgroundColor: "rgba(214, 138, 0, 0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(214, 138, 0, 0.35)",
+    borderRadius: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  snapItemLowConfidenceText: {
+    fontSize: 10.5,
+    fontWeight: "700",
+    color: "#9A6A00",
   },
   snapItemActionsRow: {
     flexDirection: "row",
@@ -4152,13 +7628,16 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 4,
   },
+  snapItemActionsRowPending: {
+    opacity: 0.32,
+  },
   snapEnhanceBtn: {
     paddingVertical: 9,
     paddingHorizontal: 12,
     borderRadius: 10,
     borderWidth: 1.5,
-    borderColor: "rgba(0,0,0,0.18)",
-    backgroundColor: "#fff",
+    borderColor: Colors.borderStrong,
+    backgroundColor: Colors.surfaceElevated,
     minWidth: 100,
     alignItems: "center",
     justifyContent: "center",
@@ -4171,18 +7650,34 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: Colors.text,
   },
+  snapAdjustBtn: {
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: Colors.borderStrong,
+    backgroundColor: Colors.surfaceElevated,
+    minWidth: 80,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  snapAdjustBtnText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: Colors.text,
+  },
   snapConfigureBtn: {
     flex: 1,
     paddingVertical: 9,
     borderRadius: 10,
-    backgroundColor: "#000",
+    backgroundColor: Colors.accent,
     alignItems: "center",
     justifyContent: "center",
   },
   snapConfigureBtnText: {
     fontSize: 13,
     fontWeight: "700",
-    color: "#fff",
+    color: Colors.white,
   },
   reviewAppendLoading: {
     marginHorizontal: 20,
@@ -4191,7 +7686,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 16,
     borderRadius: 14,
-    backgroundColor: "rgba(0,0,0,0.045)",
+    backgroundColor: Editorial.cardBgMuted,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
@@ -4208,16 +7703,17 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingHorizontal: 16,
     paddingTop: 12,
-    backgroundColor: Colors.bg,
+    backgroundColor: Colors.navBarFillOnWarm,
     borderTopWidth: 1,
-    borderTopColor: "rgba(0,0,0,0.08)",
+    borderTopColor: Colors.border,
   },
   reviewStickySecondary: {
     paddingVertical: 14,
     paddingHorizontal: 14,
     borderRadius: 28,
     borderWidth: 1.5,
-    borderColor: "rgba(0,0,0,0.15)",
+    borderColor: Colors.borderStrong,
+    backgroundColor: Colors.surfaceElevated,
   },
   reviewStickySecondaryText: {
     fontSize: 13,
@@ -4228,7 +7724,7 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingVertical: 16,
     borderRadius: 28,
-    backgroundColor: "#000",
+    backgroundColor: Colors.accent,
     alignItems: "center",
     justifyContent: "center",
     minHeight: 52,
@@ -4237,7 +7733,7 @@ const styles = StyleSheet.create({
     opacity: 0.4,
   },
   reviewStickyPrimaryText: {
-    color: "#fff",
+    color: Colors.white,
     fontSize: 15,
     fontWeight: "800",
   },
@@ -4249,24 +7745,20 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   uploadEditCard: {
-    backgroundColor: "#fff",
+    width: "100%",
+    maxWidth: 600,
+    maxHeight: "88%",
+    alignSelf: "center",
+    backgroundColor: Colors.navBarFillOnWarm,
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
-    padding: 24,
-    maxHeight: "88%",
+    paddingHorizontal: 18,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderColor: Colors.border,
   },
-  uploadEditItemThumb: {
-    width: "100%",
-    height: 200,
-    backgroundColor: "#F5F1EC", // warm neutral — consistent with review card thumbnail
-    borderRadius: 12,
-    marginBottom: 16,
-    overflow: "hidden",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  uploadEditItemThumbImg: {
-    height: "100%",
+  uploadEditScrollContent: {
+    paddingBottom: 4,
   },
   carouselDots: {
     position: "absolute",
@@ -4281,94 +7773,94 @@ const styles = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: "rgba(0,0,0,0.2)",
+    backgroundColor: Colors.borderStrong,
   },
   carouselDotActive: {
-    backgroundColor: "rgba(0,0,0,0.6)",
+    backgroundColor: Colors.accent,
   },
   uploadEditHeader: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 20,
+    marginBottom: 10,
   },
   uploadEditTitle: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: "800",
-    color: "#000",
+    color: Colors.text,
   },
   uploadEditCloseBtn: {
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: "rgba(0,0,0,0.06)",
+    backgroundColor: Editorial.ghostBg,
     alignItems: "center",
     justifyContent: "center",
+    borderWidth: 1,
+    borderColor: Editorial.ghostBorder,
   },
   uploadEditLabel: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "rgba(0,0,0,0.4)",
+    fontSize: 10,
+    fontWeight: "800",
+    color: Colors.textMuted,
     textTransform: "uppercase",
-    letterSpacing: 0.5,
-    marginBottom: 6,
+    letterSpacing: 0.8,
+    marginBottom: 4,
   },
   uploadEditInput: {
-    backgroundColor: "rgba(0,0,0,0.05)",
+    backgroundColor: Colors.surface,
     borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
     fontSize: 15,
-    color: "#000",
-    marginBottom: 16,
+    color: Colors.text,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: Colors.border,
   },
   uploadEditChipRow: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 8,
-    marginBottom: 20,
+    gap: 6,
+    marginBottom: 10,
   },
   uploadEditChip: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 20,
-    backgroundColor: "rgba(0,0,0,0.05)",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: Editorial.ghostBg,
     borderWidth: 1.5,
-    borderColor: "rgba(0,0,0,0.08)",
+    borderColor: Editorial.ghostBorder,
   },
   uploadEditChipOn: {
-    backgroundColor: "#000",
-    borderColor: "#000",
+    backgroundColor: Colors.accent,
+    borderColor: Colors.accent,
   },
   uploadEditChipText: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: "600",
-    color: "rgba(0,0,0,0.5)",
+    color: Colors.textMuted,
   },
   uploadEditChipTextOn: {
-    color: "#fff",
+    color: Colors.white,
   },
   uploadColorTrigger: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: 12,
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.1)",
-    backgroundColor: "rgba(0,0,0,0.04)",
-    marginBottom: 20,
+    borderColor: Colors.border,
+    backgroundColor: Colors.surface,
+    marginBottom: 10,
   },
   uploadColorTriggerTitle: {
-    fontSize: 15,
+    flex: 1,
+    fontSize: 14,
     fontWeight: "600",
-    color: "#000",
-  },
-  uploadColorTriggerSub: {
-    fontSize: 11,
-    color: Colors.textMuted,
-    marginTop: 2,
+    color: Colors.text,
   },
   uploadOccasionGrid: {
     gap: 8,
@@ -4377,7 +7869,7 @@ const styles = StyleSheet.create({
   uploadOccasionGroupLabel: {
     fontSize: 8,
     fontWeight: "900",
-    color: "rgba(0,0,0,0.3)",
+    color: Colors.textMuted,
     letterSpacing: 1.5,
     textTransform: "uppercase",
     marginBottom: 4,
@@ -4391,52 +7883,53 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
-    backgroundColor: "rgba(0,0,0,0.04)",
+    backgroundColor: Editorial.ghostBg,
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.08)",
+    borderColor: Editorial.ghostBorder,
   },
   uploadOccChipOn: {
-    backgroundColor: "#000",
-    borderColor: "#000",
+    backgroundColor: Colors.accent,
+    borderColor: Colors.accent,
   },
   uploadOccChipText: {
     fontSize: 9,
     fontWeight: "800",
-    color: "rgba(0,0,0,0.4)",
+    color: Colors.textMuted,
     textTransform: "uppercase",
   },
   uploadOccChipTextOn: {
-    color: "#fff",
+    color: Colors.white,
   },
   uploadEditActions: {
     flexDirection: "row",
-    gap: 12,
-    marginTop: 16,
+    gap: 10,
+    marginTop: 6,
   },
   uploadEditCancelBtn: {
     flex: 1,
-    paddingVertical: 14,
+    paddingVertical: 12,
     borderRadius: 12,
     borderWidth: 1.5,
-    borderColor: "rgba(0,0,0,0.12)",
+    borderColor: Colors.borderStrong,
     alignItems: "center",
+    backgroundColor: Colors.surfaceElevated,
   },
   uploadEditCancelText: {
     fontSize: 15,
     fontWeight: "700",
-    color: "#000",
+    color: Colors.text,
   },
   uploadEditSaveBtn: {
     flex: 1,
-    paddingVertical: 14,
+    paddingVertical: 12,
     borderRadius: 12,
-    backgroundColor: "#000",
+    backgroundColor: Colors.accent,
     alignItems: "center",
   },
   uploadEditSaveText: {
     fontSize: 15,
     fontWeight: "700",
-    color: "#fff",
+    color: Colors.white,
   },
   scrollContent: {
     paddingBottom: 160,
@@ -4458,10 +7951,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingVertical: 12,
     borderRadius: 30,
-    backgroundColor: "rgba(0,0,0,0.6)",
+    backgroundColor: Colors.accent,
   },
   pillBtnText: {
-    color: "#FFF",
+    color: Colors.white,
     fontWeight: "800",
     fontSize: 12,
     letterSpacing: 1,
@@ -4476,13 +7969,21 @@ const styles = StyleSheet.create({
     color: Colors.text,
     letterSpacing: 2,
     marginBottom: 16,
+    textAlign: "center",
+  },
+  extractionSub: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: Colors.textMuted,
+    textAlign: "center",
+    lineHeight: 18,
   },
   reviewCard: {
     padding: 20,
-    borderRadius: 16,
-    backgroundColor: Colors.surface,
+    borderRadius: Editorial.cardRadius,
+    backgroundColor: Editorial.cardBg,
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.06)",
+    borderColor: Editorial.cardBorderSubtle,
     marginBottom: 12,
   },
   cardHeader: {
@@ -4511,7 +8012,7 @@ const styles = StyleSheet.create({
   occasionGroupLabel: {
     fontSize: 9,
     fontWeight: "900",
-    color: "rgba(0,0,0,0.3)",
+    color: Colors.textMuted,
     letterSpacing: 1.5,
     textTransform: "uppercase",
     marginBottom: 5,
@@ -4525,31 +8026,31 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 5,
     borderRadius: 8,
-    backgroundColor: "rgba(0,0,0,0.04)",
+    backgroundColor: Editorial.ghostBg,
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.08)",
+    borderColor: Editorial.ghostBorder,
   },
   miniChipActive: {
-    backgroundColor: "#000",
-    borderColor: "#000",
+    backgroundColor: Colors.accent,
+    borderColor: Colors.accent,
   },
   miniChipText: {
     fontSize: 9,
     fontWeight: "800",
-    color: "rgba(0,0,0,0.4)",
+    color: Colors.textMuted,
     textTransform: "uppercase",
   },
   miniChipTextActive: {
-    color: "#FFF",
+    color: Colors.white,
   },
   metaRow: {
     borderTopWidth: 1,
-    borderTopColor: "rgba(0,0,0,0.05)",
+    borderTopColor: Colors.border,
     paddingTop: 8,
   },
   metaValueSmall: {
     fontSize: 11,
-    color: "rgba(0,0,0,0.35)",
+    color: Colors.textMuted,
     fontWeight: "600",
   },
   removeBtn: {
@@ -4566,6 +8067,30 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "900",
   },
+  snapItemDots: {
+    position: "absolute",
+    bottom: 8,
+    left: 0,
+    right: 0,
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 4,
+    zIndex: 10,
+  },
+  snapItemDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 2.5,
+    backgroundColor: "rgba(255,255,255,0.4)",
+    borderWidth: 1,
+    borderColor: "rgba(0,0,0,0.1)",
+  },
+  snapItemDotActive: {
+    backgroundColor: Colors.accent,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
   saveBtn: {
     backgroundColor: Colors.accent,
     height: 56,
@@ -4575,7 +8100,7 @@ const styles = StyleSheet.create({
     marginTop: 20,
   },
   saveBtnText: {
-    color: "#000",
+    color: Colors.white,
     fontSize: 14,
     fontWeight: "900",
     letterSpacing: 1,
@@ -4608,11 +8133,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 22,
     alignItems: "center",
     gap: 18,
-    backgroundColor: Colors.surface,
+    backgroundColor: Editorial.cardBg,
     borderRadius: 28,
     borderWidth: 1,
-    borderColor: "rgba(0,0,0,0.08)",
-    shadowColor: "#000",
+    borderColor: Editorial.cardBorderSubtle,
+    shadowColor: Colors.accentDark,
     shadowOffset: { width: 0, height: 10 },
     shadowOpacity: 0.06,
     shadowRadius: 24,
@@ -4622,12 +8147,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 999,
-    backgroundColor: "rgba(0,0,0,0.06)",
+    backgroundColor: Editorial.chipBg,
+    borderWidth: 1,
+    borderColor: Editorial.chipBorder,
   },
   doneKickerText: {
     fontSize: 11,
     fontWeight: "800",
-    color: "rgba(0,0,0,0.55)",
+    color: Colors.textMuted,
     letterSpacing: 1,
     textTransform: "uppercase",
   },
@@ -4685,12 +8212,12 @@ const styles = StyleSheet.create({
     width: "100%",
     minHeight: 56,
     borderRadius: 28,
-    backgroundColor: "#000",
+    backgroundColor: Colors.accent,
     alignItems: "center",
     justifyContent: "center",
   },
   donePrimaryBtnText: {
-    color: "#fff",
+    color: Colors.white,
     fontSize: 14,
     fontWeight: "800",
     letterSpacing: 0.8,
@@ -4700,8 +8227,8 @@ const styles = StyleSheet.create({
     minHeight: 54,
     borderRadius: 28,
     borderWidth: 1.5,
-    borderColor: "rgba(0,0,0,0.12)",
-    backgroundColor: "#fff",
+    borderColor: Colors.borderStrong,
+    backgroundColor: Colors.surfaceElevated,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -4716,12 +8243,14 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.35)",
   },
   addMoreSheet: {
-    backgroundColor: "#fff",
+    backgroundColor: Colors.navBarFillOnWarm,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     paddingHorizontal: 20,
     paddingTop: 14,
-    shadowColor: "#000",
+    borderTopWidth: 1,
+    borderColor: Colors.border,
+    shadowColor: Colors.accentDark,
     shadowOffset: { width: 0, height: -4 },
     shadowOpacity: 0.1,
     shadowRadius: 16,
@@ -4731,7 +8260,7 @@ const styles = StyleSheet.create({
     width: 40,
     height: 5,
     borderRadius: 3,
-    backgroundColor: "rgba(0,0,0,0.15)",
+    backgroundColor: Colors.borderStrong,
     alignSelf: "center",
     marginBottom: 18,
   },
@@ -4747,13 +8276,15 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     gap: 16,
     borderTopWidth: 1,
-    borderTopColor: "rgba(0,0,0,0.06)",
+    borderTopColor: Colors.border,
   },
   sheetOptionIcon: {
     width: 48,
     height: 48,
     borderRadius: 14,
-    backgroundColor: "rgba(0,0,0,0.05)",
+    backgroundColor: Editorial.cardBgMuted,
+    borderWidth: 1,
+    borderColor: Editorial.cardBorderSubtle,
     justifyContent: "center",
     alignItems: "center",
   },
@@ -4769,5 +8300,174 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.textMuted,
     marginTop: 2,
+  },
+
+  outfitReviewHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  outfitReviewTitle: {
+    fontSize: 18,
+    fontWeight: "800",
+    color: Colors.text,
+  },
+  outfitReviewSub: {
+    fontSize: 13,
+    color: Colors.textMuted,
+    marginBottom: 16,
+    lineHeight: 18,
+  },
+  outfitBatchProgress: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: Colors.text,
+    marginBottom: 10,
+    marginTop: -4,
+  },
+  outfitReviewHero: {
+    width: "100%",
+    aspectRatio: 0.75,
+    borderRadius: Editorial.cardRadius,
+    overflow: "hidden",
+    backgroundColor: Colors.imageLetterbox,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  outfitReviewHeroImg: {
+    width: "100%",
+    height: "100%",
+  },
+  outfitFieldLabel: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: Colors.textMuted,
+    letterSpacing: 1.2,
+    marginBottom: 8,
+    textTransform: "uppercase",
+  },
+  outfitNameInput: {
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 16,
+    fontWeight: "600",
+    color: Colors.text,
+    marginBottom: 18,
+    backgroundColor: Colors.surface,
+  },
+  outfitWearHint: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: Colors.textMuted,
+    lineHeight: 18,
+    marginTop: -4,
+    marginBottom: 12,
+  },
+  outfitScheduleRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 24,
+  },
+  outfitSchedChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: Editorial.ghostBg,
+    borderWidth: 1,
+    borderColor: Editorial.ghostBorder,
+  },
+  outfitSchedChipOn: {
+    backgroundColor: Colors.accent,
+    borderColor: Colors.accent,
+  },
+  outfitSchedChipText: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: Colors.text,
+  },
+  outfitSchedChipTextOn: {
+    color: Colors.white,
+  },
+  outfitSkipBtn: {
+    alignItems: "center",
+    paddingVertical: 14,
+    marginBottom: 4,
+  },
+  outfitSkipBtnText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: Colors.textMuted,
+  },
+  outfitExtractBtn: {
+    backgroundColor: Colors.surfaceElevated,
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: "center",
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: Colors.borderStrong,
+  },
+  outfitExtractBtnText: {
+    color: Colors.accent,
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  outfitSaveBtn: {
+    backgroundColor: Colors.accent,
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  outfitSaveBtnText: {
+    color: Colors.white,
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  outfitDateModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
+  outfitDateModalSheet: {
+    backgroundColor: Colors.navBarFillOnWarm,
+    borderRadius: 18,
+    padding: 16,
+    maxHeight: "70%",
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  outfitDateModalTitle: {
+    fontSize: 17,
+    fontWeight: "800",
+    marginBottom: 12,
+    color: Colors.text,
+  },
+  outfitDateRow: {
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: Colors.border,
+  },
+  outfitDateRowText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: Colors.text,
+  },
+  outfitDateCancel: {
+    marginTop: 12,
+    alignItems: "center",
+    paddingVertical: 12,
+  },
+  outfitDateCancelText: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: Colors.textMuted,
   },
 });
