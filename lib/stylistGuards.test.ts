@@ -31,7 +31,10 @@ import {
   recentlySuggestedIds,
   rotationSortForPrompt,
   sanitizeOutfitSelection,
+  spendCallBudget,
+  StylistCallBudgetExhausted,
   userStyleMatchIds,
+  type StylistCallBudget,
   type StylistItem,
 } from "./stylistGuards";
 
@@ -334,6 +337,52 @@ assert(normalizeFormality("Smart Casual") === "smart-casual", "formality normali
 assert(normalizeFormality("banana") === null, "unknown formality -> null");
 assert(primaryStyleFromTags(["street", "edgy"]) === "street", "primary style = first tag");
 assert(primaryStyleFromTags([]) === "casual", "no tags -> casual fallback");
+
+// ── request-level Gemini call budget ─────────────────────────────────────────
+
+// No budget → never throttles (preserves per-attempt-only bounding).
+for (let i = 0; i < 50; i++) spendCallBudget(undefined);
+assert(true, "undefined budget never throttles");
+
+// A budget permits exactly `max` logical calls, then throws.
+const b1: StylistCallBudget = { used: 0, max: 3 };
+spendCallBudget(b1);
+spendCallBudget(b1);
+spendCallBudget(b1);
+assert(b1.used === 3, "budget counts each spent call");
+let threw = false;
+try {
+  spendCallBudget(b1);
+} catch (e) {
+  threw = e instanceof StylistCallBudgetExhausted;
+}
+assert(threw, "budget throws StylistCallBudgetExhausted once max is reached");
+assert(b1.used === 3, "exhausted budget is not incremented past max");
+
+// A SINGLE shared budget is drained across separate call sites (bulk + refill
+// share one object): simulate a bulk fn spending 2, then a refill fn spending
+// from what's left of an N+2-capped 5-look request (max 7).
+const shared: StylistCallBudget = { used: 0, max: 7 };
+const bulk = () => {
+  spendCallBudget(shared); // first bulk attempt
+  spendCallBudget(shared); // its one conflict/style retry
+};
+const refillOnce = () => {
+  spendCallBudget(shared); // one refill attempt
+};
+bulk();
+assert(shared.used === 2, "bulk consumes from the shared budget");
+let refills = 0;
+try {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    refillOnce();
+    refills += 1;
+  }
+} catch (e) {
+  assert(e instanceof StylistCallBudgetExhausted, "refill loop stops on exhaustion");
+}
+assert(shared.used === 7 && refills === 5, "shared budget caps total calls at max across bulk+refill");
 
 // ─────────────────────────────────────────────────────────────────────────────
 

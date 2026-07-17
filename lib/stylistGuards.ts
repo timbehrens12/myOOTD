@@ -837,6 +837,36 @@ export function isLowConfidenceClassification(
   return !Number.isFinite(c) || c < LOW_CLASSIFY_CONFIDENCE;
 }
 
+// ── Request-level Gemini-call budget ─────────────────────────────────────────
+
+/**
+ * Shared cap on Gemini text-generation calls for ONE user request. A batch
+ * request fans out into a bulk call plus per-outfit refills, each of which can
+ * make a bounded style/conflict retry; without a shared ceiling one "generate N
+ * looks" tap could make many calls. Callers that want a hard bound create one
+ * budget and thread it through every generateOutfits/generateOutfitBatch call
+ * in the request. `max` counts LOGICAL calls; each logical call may still
+ * transport-retry inside callGeminiJson on transient 429/5xx (the same prompt
+ * re-sent) — standard resilience, not extra generations. Lives here (not in
+ * api-client) so it is dependency-free and covered by the guard test suite.
+ */
+export type StylistCallBudget = { used: number; max: number };
+
+export class StylistCallBudgetExhausted extends Error {
+  constructor() {
+    super("Stylist call budget exhausted");
+    this.name = "StylistCallBudgetExhausted";
+  }
+}
+
+/** Charge one logical Gemini call to the budget, or throw when it's spent.
+ * A no-op when no budget is supplied (preserves per-attempt-only bounding). */
+export function spendCallBudget(budget?: StylistCallBudget): void {
+  if (!budget) return;
+  if (budget.used >= budget.max) throw new StylistCallBudgetExhausted();
+  budget.used += 1;
+}
+
 // ── Classify metadata normalisation ──────────────────────────────────────────
 
 const ALLOWED_STYLE_TAGS = new Set([
